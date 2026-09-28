@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-base-bg text-gray-100 antialiased;
+    font-feature-settings: 'tnum';
+    background-image: radial-gradient(circle at 15% 0%, rgba(33,150,243,0.08), transparent 40%),
+      radial-gradient(circle at 85% 15%, rgba(20,184,166,0.06), transparent 45%);
+    background-attachment: fixed;
+  }
+  ::selection {
+    @apply bg-accent/30;
+  }
+  *:focus-visible {
+    outline: 2px solid theme('colors.accent.DEFAULT');
+    outline-offset: 2px;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: theme('colors.base.border');
+    border-radius: 8px;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-base-surface border border-base-border rounded-xl shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-hover shadow-glow;
+  }
+  .btn-secondary {
+    @apply btn bg-base-surface2 text-gray-100 border border-base-border hover:border-accent-dim hover:bg-base-surface2/80;
+  }
+  .btn-danger {
+    @apply btn bg-danger/10 text-danger border border-danger/40 hover:bg-danger/20;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent text-gray-400 hover:bg-base-surface2 hover:text-gray-100;
+  }
+  .input {
+    @apply w-full rounded-lg bg-base-surface2 border border-base-border px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:border-accent-dim outline-none transition-colors;
+  }
+  .label {
+    @apply block text-xs font-medium text-gray-400 mb-1.5;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+  .icon-tile {
+    @apply flex h-11 w-11 items-center justify-center rounded-xl shadow-card;
+  }
+}

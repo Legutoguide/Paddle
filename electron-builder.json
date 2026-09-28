@@ -1,0 +1,51 @@
+{
+  "appId": "com.sponsorqr.manager",
+  "productName": "Sponsor QR Manager",
+  "copyright": "Copyright © 2026",
+  "directories": {
+    "output": "release",
+    "buildResources": "build"
+  },
+  "asar": false,
+  "files": [
+    "dist/**/*",
+    "package.json",
+    "node_modules/**/*",
+    "!node_modules/**/{CHANGELOG.md,README.md,readme.md,LICENSE,license,.bin}",
+    "!node_modules/**/*.{md,ts,map}",
+    "!node_modules/**/test/**",
+    "!node_modules/**/tests/**",
+    "!node_modules/**/*.node.obj",
+    "!node_modules/better-sqlite3/deps/**/*",
+    "!node_modules/better-sqlite3/src/**/*"
+  ],
+  "npmRebuild": false,
+  "afterPack": "scripts/afterPack.js",
+  "extraResources": [
+    {
+      "from": "resources",
+      "to": "resources"
+    }
+  ],
+  "win": {
+    "icon": "resources/icon.ico",
+    "target": [
+      { "target": "nsis", "arch": ["x64"] },
+      { "target": "portable", "arch": ["x64"] }
+    ],
+    "artifactName": "${productName} Setup ${version}.${ext}"
+  },
+  "portable": {
+    "artifactName": "${productName} Portable.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Sponsor QR Manager",
+    "artifactName": "${productName} Setup ${version}.${ext}"
+  },
+  "publish": null
+}
