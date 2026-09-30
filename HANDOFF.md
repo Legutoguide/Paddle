@@ -193,7 +193,42 @@ rollback, override audit, expiry/revoke rules, danger-zone reset),
 v5→v6 case in `migration.test.ts`. Helper `tests/unit/testDates.ts`
 (`futureSunday()`) keeps date-dependent tests from expiring.
 
-## 8. Known gaps / not done
+## 8. Bug found & fixed after initial handoff: packaged build had ZERO CSS
+
+**Symptom** (reported after building the real Windows .exe): every screen rendered
+with default browser styling only — serif font, blue underlined links, plain
+white inputs, no dark theme, no Tailwind at all. Confirmed **pre-existing in the
+original app**, unrelated to the reservation work — nobody had run a packaged
+build and clicked through it before.
+
+**Root cause:** `src/renderer/index.html`'s CSP had `style-src 'self' 'unsafe-inline'`.
+In dev mode (`loadURL('http://localhost:5173')`) this works because Vite injects
+dev CSS via inline `<style>` tags, covered by `'unsafe-inline'`. In the packaged
+build, `main.ts` uses `loadFile(...)`, so the page runs under `file://`, and
+Vite's production build injects the compiled CSS as an external
+`<link rel="stylesheet" href="./assets/xxx.css">` — which is **not** covered by
+`'unsafe-inline'` and requires source-list matching. `'self'` does not reliably
+match other `file://` sub-resources in Chromium/Electron (a known Electron/CSP
+gotcha), so the stylesheet silently failed to load. Same mechanism would have
+also affected `img-src`/`script-src` for any local file assets.
+
+**Fix:** added the `file:` scheme explicitly to `default-src`, `script-src`,
+`style-src`, `img-src`, `media-src`, `font-src` in the CSP meta tag. Regression
+guard: `tests/unit/csp.test.ts` (fails if `file:` is ever removed again).
+
+**Still worth doing later** (not done — bigger, riskier change): the more
+"correct" long-term fix is a custom privileged protocol via `protocol.handle`
+instead of raw `file://`, which gives the page a real, stable origin. The CSP
+fix above is the standard, minimal, well-documented fix and should be enough —
+flagging the alternative in case the file:// origin causes other quirks later
+(e.g. with locally-stored sponsor/campaign images).
+
+**Verify after rebuilding:** `npm run build && npm run package:win`, install the
+new `.exe`, confirm the dark theme/Tailwind styling now renders (not just the
+dev build, which never showed the bug).
+
+
+## 9. Known gaps / not done
 
 * Everything in §1 marked NOT RUN. Highest risk: first real `npm run build`
   and first launch of the new screens.
