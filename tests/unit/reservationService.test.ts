@@ -27,7 +27,7 @@ describe('ReservationService — Walk-in / Advance creation', () => {
     pricing.create({ name: 'Standard hour', weekdayMask: 127, durationMin: 60, priceCents: 10000 });
   });
 
-  test('creates a Walk-in reservation as CONFIRMED with the resolved price', () => {
+  test('price scales with players: a 100 TND/player rule × 2 players = 200 TND, not 100 flat', () => {
     const r = reservations.createWalkIn({
       customer: { name: 'Amir', phone: '20123456' },
       reservationDate: TEST_DATE,
@@ -37,9 +37,20 @@ describe('ReservationService — Walk-in / Advance creation', () => {
     });
     assert.equal(r.reservationType, 'WALK_IN');
     assert.equal(r.status, 'CONFIRMED');
-    assert.equal(r.basePriceCents, 10000);
-    assert.equal(r.finalPriceCents, 10000);
+    assert.equal(r.basePriceCents, 20000, 'pricing_rules.priceCents is a PER-PLAYER rate');
+    assert.equal(r.finalPriceCents, 20000);
     assert.equal(r.paymentStatus, 'UNPAID');
+  });
+
+  test('1 player still just pays the plain per-player rate', () => {
+    const r = reservations.createWalkIn({
+      customer: { name: 'Solo', phone: '20000009' },
+      reservationDate: TEST_DATE,
+      startTime: '10:00',
+      durationMin: 60,
+      players: 1,
+    });
+    assert.equal(r.basePriceCents, 10000);
   });
 
   test('creates an Advance reservation the same way', () => {
@@ -301,5 +312,32 @@ describe('Input validation (IPC input is untrusted)', () => {
     assert.throws(() => pricing.create({ name: 'X', weekdayMask: 1, durationMin: 60, priceCents: 9.5 }), /whole cents/);
     assert.throws(() => pricing.update(1, { weekdayMask: 0 }), /day of the week/);
     assert.equal(res.list().length, 0, 'nothing may be created by rejected input');
+  });
+});
+
+describe('Per-player pricing (pricing_rules.priceCents is a PER-PLAYER rate)', () => {
+  test('base price scales linearly with players when no coupon is attached', () => {
+    const db = createTestDb();
+    const reservations = new ReservationService(db);
+    new PricingService(db).create({ name: 'Board rental', weekdayMask: 127, durationMin: 60, priceCents: 3000 }); // 30 TND/player
+    const make = (players: number, startTime: string) =>
+      reservations.createWalkIn({ customer: { name: 'X', phone: String(1000 + players) }, reservationDate: TEST_DATE, startTime, durationMin: 60, players });
+
+    assert.equal(make(1, '09:00').basePriceCents, 3000);
+    assert.equal(make(2, '10:00').basePriceCents, 6000);
+    assert.equal(make(3, '11:00').basePriceCents, 9000);
+    assert.equal(make(4, '12:00').basePriceCents, 12000);
+  });
+
+  test('rescheduling a walk-in to a new date keeps per-player scaling for a reservation with no coupon', () => {
+    const db = createTestDb();
+    const reservations = new ReservationService(db);
+    new PricingService(db).create({ name: 'Board rental', weekdayMask: 127, durationMin: 60, priceCents: 3000 });
+    const r = reservations.createWalkIn({ customer: { name: 'X', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 3 });
+    assert.equal(r.basePriceCents, 9000);
+    const moved = reservations.rescheduleToAdvance({
+      reservationId: r.id, reservationDate: futureSunday(21), startTime: '09:00', durationMin: 60,
+    });
+    assert.equal(moved.basePriceCents, 9000, 'still 30 TND x 3 players at the new date');
   });
 });

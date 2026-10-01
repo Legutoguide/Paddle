@@ -87,7 +87,7 @@ export default function BookingSetup() {
           <h2 className="text-sm font-semibold text-white">Pricing rules</h2>
           {can('pricing.edit') && <button className="btn-secondary" onClick={() => setEditRule('new')}><Plus size={15} /> Add rule</button>}
         </div>
-        <p className="text-xs text-gray-500">The highest-priority active rule matching the day, period and duration sets the price. With no matching rule, booking is blocked — a price is never guessed.</p>
+        <p className="text-xs text-gray-500">Price is <strong>per player</strong> — the highest-priority active rule matching the day, period and duration is multiplied by the number of players. A coupon with its own configured price (e.g. a group package) replaces this instead of stacking with it. With no matching rule, booking is blocked — a price is never guessed.</p>
         <RulesTable rules={rules} periods={periods} onEdit={can('pricing.edit') ? setEditRule : undefined} />
       </section>
 
@@ -147,7 +147,7 @@ function RulesTable({ rules, periods, onEdit }: { rules: PricingRule[]; periods:
   return (
     <table className="w-full text-sm">
       <thead className="text-left text-xs text-gray-500">
-        <tr><th className="py-2">Rule</th><th>Days</th><th>Period</th><th>Duration</th><th>Price</th><th>Priority</th><th /></tr>
+        <tr><th className="py-2">Rule</th><th>Days</th><th>Period</th><th>Duration</th><th>Price/player</th><th>Priority</th><th /></tr>
       </thead>
       <tbody>
         {rules.map((r) => (
@@ -219,7 +219,7 @@ function RuleForm({ rule, periods, onClose, onSaved }: { rule: PricingRule | nul
             </select>
           </div>
           <div><label className="label">Duration (min)</label><input className="input" type="number" min={15} step={15} value={duration} onChange={(e) => setDuration(Number(e.target.value))} /></div>
-          <div><label className="label">Price ({settings.currency})</label><input className="input" type="number" min={0} step="0.01" value={price} onChange={(e) => setPrice(e.target.value)} /></div>
+          <div><label className="label">Price per player ({settings.currency})</label><input className="input" type="number" min={0} step="0.01" value={price} onChange={(e) => setPrice(e.target.value)} /><p className="mt-1 text-[11px] text-gray-500">Charged per player. 2 players = 2× this amount, unless a coupon with its own package price is attached.</p></div>
           <div><label className="label">Priority</label><input className="input" type="number" value={priority} onChange={(e) => setPriority(Number(e.target.value))} /></div>
         </div>
         <label className="flex items-center gap-2 text-sm text-gray-400"><input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} /> Active</label>

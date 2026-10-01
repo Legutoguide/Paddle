@@ -17,6 +17,7 @@ interface CouponPreview {
   code: string;
   sponsorName: string;
   campaignName: string;
+  originalPriceCents: number;
   discountType: 'PERCENTAGE' | 'FIXED';
   discountPercentage: number;
   discountAmountCents: number;
@@ -122,15 +123,20 @@ export default function NewReservation() {
   const durationMin = slot ? toMin(slot.endTime) - toMin(slot.startTime) : 0;
 
   // Price comes from the configured pricing rules — never hardcoded.
+  // pricingRules.preview() returns a PER-PLAYER rate; `perPlayerRate` stays
+  // that raw rate for display, while `breakdown` below does the actual
+  // player-count scaling (and the coupon-override, when one is attached).
+  const [perPlayerRate, setPerPlayerRate] = useState<number | null>(null);
   useEffect(() => {
+    setPerPlayerRate(null);
     setBasePrice(null);
     setPriceError(null);
     if (!slot) return;
     window.api.pricingRules
       .preview({ date, periodId: slot.periodId, durationMin })
-      .then((rule) => setBasePrice(rule.priceCents))
+      .then((rule) => { setPerPlayerRate(rule.priceCents); setBasePrice(rule.priceCents * players); })
       .catch((e) => setPriceError(e instanceof Error ? e.message : 'No price configured'));
-  }, [slot, date, durationMin]);
+  }, [slot, date, durationMin, players]);
 
   const applyCoupon = async () => {
     setCouponError(null);
@@ -145,6 +151,7 @@ export default function NewReservation() {
           code: c.code,
           sponsorName: c.sponsorName,
           campaignName: c.campaignName,
+          originalPriceCents: c.originalPriceCents,
           discountType: c.discountType,
           discountPercentage: c.discountPercentage,
           discountAmountCents: c.discountAmountCents,
@@ -160,17 +167,23 @@ export default function NewReservation() {
     }
   };
 
+  // A coupon's own campaign price REPLACES the per-player total — it does
+  // not stack on top of it (a coupon often already represents a specific
+  // group package the business configured, e.g. a "2 players" deal).
   const breakdown = useMemo(() => {
+    if (coupon) {
+      const b = calculatePrice({
+        originalPriceCents: coupon.originalPriceCents,
+        discountType: coupon.discountType,
+        discountPercentage: coupon.discountPercentage,
+        discountAmountCents: coupon.discountAmountCents,
+      });
+      return { base: coupon.originalPriceCents, discount: b.youSaveCents, final: b.finalPriceCents };
+    }
     if (basePrice === null) return null;
-    if (!coupon) return { base: basePrice, discount: 0, final: basePrice };
-    const b = calculatePrice({
-      originalPriceCents: basePrice,
-      discountType: coupon.discountType,
-      discountPercentage: coupon.discountPercentage,
-      discountAmountCents: coupon.discountAmountCents,
-    });
-    return { base: basePrice, discount: b.youSaveCents, final: b.finalPriceCents };
+    return { base: basePrice, discount: 0, final: basePrice };
   }, [basePrice, coupon]);
+
 
   // Which slots can this party actually book right now?
   const bookable = (s: AvailabilitySlot): boolean => {
@@ -420,6 +433,7 @@ export default function NewReservation() {
               <p className="text-sm text-success">
                 ✓ {coupon.sponsorName} · {coupon.campaignName} —{' '}
                 {coupon.discountType === 'PERCENTAGE' ? `${coupon.discountPercentage}% off` : `${formatMoney(coupon.discountAmountCents)} off`}. It will be locked to this booking and used automatically when it is paid.
+                {' '}This coupon's own price ({formatMoney(coupon.originalPriceCents)}) is used instead of the per-player rate.
               </p>
             )}
             {couponError && <p className="text-sm text-danger">{couponError}</p>}
@@ -441,7 +455,16 @@ export default function NewReservation() {
               <p className="text-danger">{priceError} Ask an admin to add a pricing rule in Booking Setup.</p>
             ) : breakdown ? (
               <>
-                <Line k="Price" v={formatMoney(breakdown.base)} />
+                {coupon ? (
+                  <Line k="Coupon package price" v={formatMoney(breakdown.base)} />
+                ) : (
+                  <>
+                    <Line k="Price" v={formatMoney(breakdown.base)} />
+                    {perPlayerRate !== null && players > 1 && (
+                      <p className="text-right text-[11px] text-gray-500">{formatMoney(perPlayerRate)} × {players} players</p>
+                    )}
+                  </>
+                )}
                 {breakdown.discount > 0 && <Line k="Coupon discount" v={`− ${formatMoney(breakdown.discount)}`} />}
                 <Line k="Total" v={formatMoney(breakdown.final)} strong />
               </>

@@ -241,25 +241,54 @@ describe('Coupon <-> Reservation integration (atomic payment rule)', () => {
     assert.equal(paid.couponId, null);
   });
 
-  test('attachCoupon / detachCoupon on an existing reservation before payment', () => {
+  test('attachCoupon / detachCoupon on an existing reservation before payment (players=2)', () => {
     const r = reservations.createAdvance({
       customer: { name: 'Amir', phone: '20123456' },
       reservationDate: TEST_DATE,
       startTime: '10:00',
       durationMin: 60,
-      players: 1,
+      players: 2,
     });
     assert.equal(r.couponId, null);
+    assert.equal(r.basePriceCents, 20000, 'no coupon yet: per-player rate (10000) x 2 players');
 
+    // The coupon's own campaign price (10000, from beforeEach) REPLACES the
+    // per-player total (20000) — it does not stack on top of it.
     const withCoupon = reservations.attachCoupon(r.id, couponCode);
     assert.equal(withCoupon.couponId, coupons.getByCode(couponCode)!.id);
+    assert.equal(withCoupon.basePriceCents, 10000, "base becomes the coupon's own package price, not 20000+discount");
     assert.equal(withCoupon.finalPriceCents, 8000);
     assert.equal(coupons.getByCode(couponCode)!.status, 'RESERVED');
 
+    // Detaching restores the per-player total, not the coupon's package price.
     const detached = reservations.detachCoupon(r.id);
     assert.equal(detached.couponId, null);
-    assert.equal(detached.finalPriceCents, detached.basePriceCents);
+    assert.equal(detached.basePriceCents, 20000, 'detach must restore the per-player rate x players, not leave the coupon price behind');
+    assert.equal(detached.finalPriceCents, 20000);
     assert.equal(coupons.getByCode(couponCode)!.status, 'AVAILABLE');
+  });
+
+  test("a group-package coupon set at reservation creation is NOT multiplied by player count", () => {
+    // A campaign the business configured specifically as a "2 players" deal
+    // at 45 TND total — its own originalPriceCents must be used as-is.
+    const sponsor2 = new SponsorService(db).create({ name: 'Group Deals Co' });
+    const groupCampaign = new CampaignService(db).create({
+      sponsorId: sponsor2.id, campaignName: '2-Player Package', serviceName: '1 Hour for 2',
+      originalPrice: 45, discountPercentage: 10,
+    });
+    const groupCode = coupons.generateCodes({ campaignId: groupCampaign.id, count: 1, prefix: 'GRP2' })[0].code;
+
+    const r = reservations.createAdvance({
+      customer: { name: 'Sara', phone: '20999888' },
+      reservationDate: TEST_DATE,
+      startTime: '11:00',
+      durationMin: 60,
+      players: 2,
+      couponCode: groupCode,
+    });
+    // NOT 10000 (per-player rate) x 2 = 20000 — the coupon's own 4500 wins.
+    assert.equal(r.basePriceCents, 4500);
+    assert.equal(r.finalPriceCents, 4050); // 4500 - 10%
   });
 
   test('cannot attach or detach a coupon on an already-paid reservation', () => {

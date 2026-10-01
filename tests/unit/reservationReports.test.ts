@@ -55,7 +55,7 @@ describe('ReservationReportService — dashboard & reports from real data', () =
     assert.equal(s.todayAdvance, 1);
     assert.equal(s.todayOccupied, 3);
     assert.equal(s.couponReservationsToday, 1);
-    assert.equal(s.revenueTodayCents, 10000, 'only PAID reservations count as revenue');
+    assert.equal(s.revenueTodayCents, 20000, 'only PAID reservations count as revenue (2 players x 10000/player)');
     assert.equal(s.totalCustomers, 2);
   });
 

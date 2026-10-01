@@ -228,13 +228,45 @@ new `.exe`, confirm the dark theme/Tailwind styling now renders (not just the
 dev build, which never showed the bug).
 
 
-## 9. Known gaps / not done
+## 9. Bug found & fixed: price did not scale with players, and group coupons double-charged
+
+**Reported symptom:** setting a pricing rule to 30 TND and booking 2 players still
+charged 30 TND total instead of 60 — the player count was never used in the
+price calculation. Also: campaigns configured as fixed-price group packages
+(e.g. a "2 players" deal, "3 players" deal) got their price **recalculated**
+from the per-slot rate instead of using the package's own configured price.
+
+**Root cause:** `ReservationService` resolved `basePriceCents` purely from
+`pricing_rules.priceCents` for the (day, period, duration) combination and
+never multiplied by `players`.
+
+**Fix (business rule, now consistent everywhere — create, attach, detach,
+reschedule, and the booking wizard's live preview):**
+* `pricing_rules.priceCents` is a **per-player rate**. With no coupon,
+  `base_price_cents = rule.priceCents × players`.
+* When a coupon/campaign is attached, its own `originalPriceCents` (the price
+  the business configured for that campaign — e.g. a group package) **replaces**
+  the per-player total; it is never also multiplied by player count. The
+  discount then applies on top of that, as before.
+* Detaching a coupon restores the per-player total (re-resolved fresh from the
+  pricing rule — the stored value is not reused, since it may currently hold
+  the coupon's own package price).
+* `BookingSetup.tsx` and the booking wizard summary now explicitly label and
+  show "price per player × N players" so this can't be silently miscounted again.
+
+**Tests:** `reservationService.test.ts` (`Per-player pricing` suite, and the
+corrected "price scales with players" case — my own earlier test had encoded
+the bug's wrong expectation and is fixed), `couponReservationIntegration.test.ts`
+("group-package coupon ... NOT multiplied by player count", strengthened
+attach/detach test with players=2 and differing campaign vs. per-player prices).
+
+## 10. Known gaps / not done
 
 * Everything in §1 marked NOT RUN. Highest risk: first real `npm run build`
   and first launch of the new screens.
 * No reservation **print** view and no reservation CSV/PNG beyond the report CSV.
 * No refund action (`REFUNDED` exists in the schema only). Single-slot bookings
-  only (no multi-hour reservations). No per-player pricing. Reservation
+  only (no multi-hour reservations). Reservation
   reschedule UI (`rescheduleToAdvance`) not exposed. No edit-reservation screen
   (players/notes/time change = cancel + rebook, or reschedule via service).
 * Coupon totals on the existing Dashboard/Campaign/Sponsor pages count RESERVED

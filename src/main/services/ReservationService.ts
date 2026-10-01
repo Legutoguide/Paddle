@@ -203,13 +203,19 @@ export class ReservationService {
       // 2) Customer (find-or-create by phone).
       const customer = this.customers.findOrCreateByPhone(input.customer);
 
-      // 3) Price resolution — never a hardcoded price.
+      // 3) Price resolution — never a hardcoded price. pricing_rules.priceCents
+      // is a PER-PLAYER rate, so the slot's own price scales with how many
+      // players are booked (e.g. a 30 TND rule = 60 TND for 2 players) —
+      // UNLESS a coupon is attached below, in which case the coupon's own
+      // campaign price (set up by the business for that specific group,
+      // e.g. a "2 players" or "4 players" package) replaces it entirely,
+      // so a group coupon is never also multiplied by player count on top.
       const rule = this.pricing.resolvePrice({
         date: input.reservationDate,
         periodId: input.periodId ?? slot.periodId,
         durationMin: input.durationMin,
       });
-      const basePriceCents = rule.priceCents;
+      let basePriceCents = rule.priceCents * input.players;
 
       // 4) Insert the reservation first (as CONFIRMED — both Walk-in and
       // Advance commit in a single step in this UI design; see
@@ -239,15 +245,19 @@ export class ReservationService {
         );
       const reservationId = Number(insertResult.lastInsertRowid);
 
-      // 5) Optional coupon attach (AVAILABLE -> RESERVED), recomputing the
-      // final price with the discount applied on top of the resolved base
-      // price — reusing the exact same calculatePrice() campaigns use.
+      // 5) Optional coupon attach (AVAILABLE -> RESERVED). A coupon's own
+      // campaign originalPriceCents is the price the business configured
+      // for whatever that campaign covers (often a specific group size) —
+      // it REPLACES the per-player slot price above, it does not stack
+      // with it. The discount then applies on top, via the same
+      // calculatePrice() campaigns already use.
       let discountCents = 0;
       let finalPriceCents = basePriceCents;
       if (input.couponCode) {
         const coupon = this.coupons.getByCode(input.couponCode.trim());
         if (!coupon) throw new CouponNotFoundError('Coupon not found');
         this.coupons.reserveForReservation(coupon.id, reservationId, input.reservationDate);
+        basePriceCents = coupon.originalPriceCents;
         const breakdown = calculatePrice({
           originalPriceCents: basePriceCents,
           discountType: coupon.discountType,
@@ -259,9 +269,9 @@ export class ReservationService {
 
         this.db
           .prepare(
-            `UPDATE reservations SET coupon_id = ?, discount_cents = ?, final_price_cents = ? WHERE id = ?`
+            `UPDATE reservations SET coupon_id = ?, base_price_cents = ?, discount_cents = ?, final_price_cents = ? WHERE id = ?`
           )
-          .run(coupon.id, discountCents, finalPriceCents, reservationId);
+          .run(coupon.id, basePriceCents, discountCents, finalPriceCents, reservationId);
       }
 
       this.recordHistory(reservationId, null, 'CONFIRMED', input.createdByUserId ?? null, `${reservationType} created`);
@@ -297,6 +307,16 @@ export class ReservationService {
   // Coupon attach/detach on an existing reservation (before payment).
   // --------------------------------------------------------------------
 
+  /** The slot's own per-player price × players, with no coupon involved —
+   * used both to show what a booking would cost without a coupon and to
+   * restore it correctly when a coupon is detached. Never reuses a stored
+   * base_price_cents directly, since that column may currently hold a
+   * coupon's own (non-per-player) package price instead. */
+  private resolveNoCouponBasePrice(reservationDate: string, periodId: number | null, durationMin: number, players: number): number {
+    const rule = this.pricing.resolvePrice({ date: reservationDate, periodId, durationMin });
+    return rule.priceCents * players;
+  }
+
   attachCoupon(reservationId: number, couponCode: string, actorUserId: number | null = null): Reservation {
     const attach = this.db.transaction((): Reservation => {
       const reservation = this.getById(reservationId);
@@ -311,17 +331,22 @@ export class ReservationService {
       if (!coupon) throw new CouponNotFoundError('Coupon not found');
 
       this.coupons.reserveForReservation(coupon.id, reservationId, reservation.reservationDate);
+      // The coupon's own campaign price replaces the per-player slot price
+      // — it does not stack with it (see createInternal for the full
+      // reasoning: a coupon often already represents a specific group's
+      // package price, e.g. "2 players", configured by the business).
+      const basePriceCents = coupon.originalPriceCents;
       const breakdown = calculatePrice({
-        originalPriceCents: reservation.basePriceCents,
+        originalPriceCents: basePriceCents,
         discountType: coupon.discountType,
         discountPercentage: coupon.discountPercentage,
         discountAmountCents: coupon.discountAmountCents,
       });
       this.db
         .prepare(
-          `UPDATE reservations SET coupon_id = ?, discount_cents = ?, final_price_cents = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+          `UPDATE reservations SET coupon_id = ?, base_price_cents = ?, discount_cents = ?, final_price_cents = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
         )
-        .run(coupon.id, breakdown.youSaveCents, breakdown.finalPriceCents, reservationId);
+        .run(coupon.id, basePriceCents, breakdown.youSaveCents, breakdown.finalPriceCents, reservationId);
 
       this.audit.log('RESERVATION_COUPON_ATTACHED', 'reservation', reservationId, { couponId: coupon.id, actorUserId });
       return this.getById(reservationId)!;
@@ -339,12 +364,21 @@ export class ReservationService {
       if (reservation.couponId) {
         this.coupons.releaseReservation(reservation.couponId, reservationId);
       }
+      // Restore the per-player slot price — base_price_cents currently
+      // holds the coupon's own package price, not the per-player rate, so
+      // it must be re-resolved fresh rather than reused as-is.
+      const restoredBase = this.resolveNoCouponBasePrice(
+        reservation.reservationDate,
+        reservation.periodId,
+        reservation.durationMin,
+        reservation.players
+      );
       this.db
         .prepare(
-          `UPDATE reservations SET coupon_id = NULL, discount_cents = 0, final_price_cents = base_price_cents,
+          `UPDATE reservations SET coupon_id = NULL, base_price_cents = ?, discount_cents = 0, final_price_cents = ?,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
         )
-        .run(reservationId);
+        .run(restoredBase, restoredBase, reservationId);
       this.audit.log('RESERVATION_COUPON_DETACHED', 'reservation', reservationId, { actorUserId });
       return this.getById(reservationId)!;
     });
@@ -548,13 +582,17 @@ export class ReservationService {
         durationMin: params.durationMin,
       });
 
+      // Same rule as creation/attach: a coupon's own campaign price
+      // replaces the per-player slot price rather than stacking with it.
+      let basePriceCents = rule.priceCents * original.players;
       let discountCents = 0;
-      let finalPriceCents = rule.priceCents;
+      let finalPriceCents = basePriceCents;
       if (original.couponId) {
         const coupon = this.coupons.getDetailsById(original.couponId);
         if (coupon) {
+          basePriceCents = coupon.originalPriceCents;
           const breakdown = calculatePrice({
-            originalPriceCents: rule.priceCents,
+            originalPriceCents: basePriceCents,
             discountType: coupon.discountType,
             discountPercentage: coupon.discountPercentage,
             discountAmountCents: coupon.discountAmountCents,
@@ -579,7 +617,7 @@ export class ReservationService {
           params.durationMin,
           params.periodId ?? slot.periodId,
           original.players,
-          rule.priceCents,
+          basePriceCents,
           discountCents,
           finalPriceCents,
           original.couponId,
