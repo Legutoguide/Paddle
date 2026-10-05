@@ -13,6 +13,9 @@ import type {
   Reservation,
   ReservationWithDetails,
   ReservationHistoryEntry,
+  ReservationParticipant,
+  CouponRedemption,
+  RedemptionStatus,
 } from '../../shared/types/domain';
 
 // Raw row shapes as returned directly by better-sqlite3 (snake_case).
@@ -55,6 +58,7 @@ export interface CampaignRow {
   discount_amount_cents: number;
   final_price_cents: number;
   total_codes: number;
+  coverage_players: number;
   image_path: string | null;
   banner_path: string | null;
   start_date: string | null;
@@ -78,6 +82,7 @@ export function mapCampaign(row: CampaignRow): Campaign {
     discountAmountCents: row.discount_amount_cents,
     finalPriceCents: row.final_price_cents,
     totalCodes: row.total_codes,
+    coveragePlayers: row.coverage_players,
     imagePath: row.image_path,
     bannerPath: row.banner_path,
     startDate: row.start_date,
@@ -143,6 +148,7 @@ export interface CouponWithDetailsRow extends CouponRow {
   discount_type: string;
   final_price_cents: number;
   campaign_status: string;
+  coverage_players: number;
 }
 
 export function mapCouponWithDetails(row: CouponWithDetailsRow): CouponWithDetails {
@@ -161,6 +167,7 @@ export function mapCouponWithDetails(row: CouponWithDetailsRow): CouponWithDetai
     discountType: row.discount_type as CouponWithDetails['discountType'],
     finalPriceCents: row.final_price_cents,
     campaignStatus: row.campaign_status as CouponWithDetails['campaignStatus'],
+    coveragePlayers: row.coverage_players,
   };
 }
 
@@ -383,6 +390,7 @@ export interface ReservationWithDetailsRow extends ReservationRow {
   customer_phone: string;
   period_name: string | null;
   coupon_code: string | null;
+  coupon_count: number;
 }
 
 export function mapReservationWithDetails(row: ReservationWithDetailsRow): ReservationWithDetails {
@@ -392,6 +400,7 @@ export function mapReservationWithDetails(row: ReservationWithDetailsRow): Reser
     customerPhone: row.customer_phone,
     periodName: row.period_name,
     couponCode: row.coupon_code,
+    couponCount: row.coupon_count,
   };
 }
 
@@ -414,5 +423,59 @@ export function mapReservationHistory(row: ReservationHistoryRow): ReservationHi
     actorUserId: row.actor_user_id,
     note: row.note,
     createdAt: row.created_at,
+  };
+}
+
+// ============================================================================
+// PRIME PADDLE — coupon coverage: participants & redemption ledger (v7)
+// ============================================================================
+
+export interface ReservationParticipantRow {
+  id: number;
+  reservation_id: number;
+  name: string | null;
+  sort_order: number;
+  created_at: string;
+}
+
+export function mapReservationParticipant(row: ReservationParticipantRow): ReservationParticipant {
+  return {
+    id: row.id,
+    reservationId: row.reservation_id,
+    name: row.name,
+    sortOrder: row.sort_order,
+    createdAt: row.created_at,
+  };
+}
+
+export interface CouponRedemptionRow {
+  id: number;
+  coupon_id: number;
+  reservation_id: number;
+  participant_id: number | null;
+  coverage_consumed: number;
+  eligible_amount_cents: number;
+  discount_cents: number;
+  status: string;
+  actor_user_id: number | null;
+  created_at: string;
+  consumed_at: string | null;
+  released_at: string | null;
+}
+
+export function mapCouponRedemption(row: CouponRedemptionRow): CouponRedemption {
+  return {
+    id: row.id,
+    couponId: row.coupon_id,
+    reservationId: row.reservation_id,
+    participantId: row.participant_id,
+    coverageConsumed: row.coverage_consumed,
+    eligibleAmountCents: row.eligible_amount_cents,
+    discountCents: row.discount_cents,
+    status: row.status as RedemptionStatus,
+    actorUserId: row.actor_user_id,
+    createdAt: row.created_at,
+    consumedAt: row.consumed_at,
+    releasedAt: row.released_at,
   };
 }

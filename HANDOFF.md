@@ -260,7 +260,104 @@ the bug's wrong expectation and is fixed), `couponReservationIntegration.test.ts
 ("group-package coupon ... NOT multiplied by player count", strengthened
 attach/detach test with players=2 and differing campaign vs. per-player prices).
 
-## 10. Known gaps / not done
+## 10. Schema v7 — coupon COVERAGE, partial redemption, participants, multi-coupon reservations
+
+A full redesign replacing §9's "coupon price replaces reservation price" model (which
+the user correctly identified as wrong — see the worked A1 example below).
+
+**The business rule:** a coupon's discount applies only to the slice of the
+reservation it *covers* (`price_per_player × campaign.coveragePlayers`), never to
+the whole reservation and never to the campaign's own listed price.
+```
+eligible_amount  = price_per_player x coupon.coveragePlayers (capped by what's left)
+discount         = discountOf(eligible_amount, campaign's %/fixed)
+reservation total = (price_per_player x players) − sum of every attached coupon's discount
+```
+Worked example (exactly the user's A1 case): 30 TND/player, 50% off, coupon
+covers 1 player, booking has 4 players → subtotal 120, eligible 30, discount
+15, **total 105** — never `120 × 50% = 60`.
+
+### Schema (v7)
+* `campaigns.coverage_players INTEGER DEFAULT 1` — how many players a coupon
+  from this campaign can cover. Read live via the existing coupon↔campaign
+  join, never duplicated onto each coupon row (same pattern as discount fields).
+* **`coupon_redemptions`** (new) — the ledger that makes partial/multi-reservation
+  coverage possible. One row = one slice of a coupon's coverage consumed by one
+  reservation (optionally one participant): `coupon_id, reservation_id,
+  participant_id, coverage_consumed, eligible_amount_cents, discount_cents,
+  status[RESERVED|CONSUMED|RELEASED], actor_user_id, timestamps`. This is also
+  the full audit trail (no separate audit table needed).
+* **`reservation_participants`** (new) — optional named players, never forced:
+  `reservation_id, name NULL, sort_order`.
+* `coupons.reservation_id` (v6) is **superseded**, not removed — new code never
+  writes to it; the v7 migration backfills any pre-existing RESERVED/USED coupon
+  into a matching ledger row so no in-flight data is lost
+  (`migration.test.ts`'s v6→v7 case proves this against a hand-built legacy DB).
+* `coupons.status`/`used_at` remain a **maintained cache**, recomputed from the
+  ledger after every reserve/release/consume (`CouponService.recomputeCachedStatus`)
+  — AVAILABLE (remaining>0), RESERVED (remaining=0, something still pending),
+  USED (remaining=0, fully paid). For the common coverage=1 case this behaves
+  identically to before; for coverage>1 it's a simplified aggregate signal.
+* Remaining coverage is **always computed live** from the ledger
+  (`CouponService.coverageState`) — never stored, can't drift.
+
+### Services
+* **`CouponService`**: `reserveCoverage`/`releaseCoverage`/`consumeCoverage`/
+  `transferCoverage` (reschedule, reprices at the new date's rate)/`coverageState`
+  replace the old single-FK `reserveForReservation` etc. `confirmUse`'s CEO
+  override now releases *every* reservation currently holding a slice of the
+  coupon (there can be more than one). `validate()`'s RESERVED outcome now
+  returns `reservations: ReservationSummary[]` (plural — coverage can be split
+  across more than one booking at once).
+* **`ReservationService`**: a reservation can carry **multiple coupons**.
+  `attachCoupon`/`detachCoupon` now take/need a coupon id (not reservation-global);
+  coverage granted is capped by both the coupon's own remaining coverage *and*
+  this reservation's uncovered player count — that capping is exactly what
+  produces partial usage. New `getPriceBreakdown(reservationId)` returns one
+  line per attached coupon (Part 10's exact format) — the authoritative,
+  always-live view; `reservations.discountCents/finalPriceCents/couponId` stay
+  as a maintained cache (`recalculateAggregates`) for simple list/report reads.
+  `markAsPaid` now **self-heals**: it recomputes the cache from the live ledger
+  immediately before charging, so a reservation is always charged the true
+  current amount even if a coupon's state changed via another path — more
+  robust than the old "throw and block payment" behavior.
+  New `listParticipants`/`setParticipants` (optional names only).
+* **`CampaignService`**: `create`/`update` accept `coveragePlayers` (validated,
+  defaults to 1).
+* **`DangerZoneService`**: reset now also clears `coupon_redemptions` and
+  `reservation_participants` (FK order fixed).
+
+### IPC / UI
+New channels: `RESERVATION_PRICE_BREAKDOWN`, `RESERVATION_LIST_PARTICIPANTS`,
+`RESERVATION_SET_PARTICIPANTS`, `COUPON_COVERAGE_STATE`; `attachCoupon`/`detachCoupon`
+signatures changed (coupon id required for detach; optional `{participantId, coverage}`
+for attach). `ReservationDetailModal` now shows the full itemized breakdown
+(one line per coupon, remove-button per line) and a collapsible optional
+participant-name editor. `NewReservation` wizard's coupon panel shows
+coverage/remaining/eligible-amount live and computes the discount correctly
+(capped preview, server always recomputes authoritatively). `Campaigns.tsx`
+gained the coverage picker (1/2/3/4/Custom); `CampaignDetail`/list show it.
+`ScanValidate`'s RESERVED card lists every reservation holding a slice.
+
+### Tests
+`couponReservationIntegration.test.ts` was fully rewritten around this model —
+every example in the spec (Part 2's 1/2/3/4-player coupon math, Part 3's
+1+1/2+2/1+3/4-at-once partial sequences, Part 7's multiple-coupons-one-reservation,
+Part 8's security/anti-fraud list, Part 9's RESERVED behavior, reservation-flow
+cases) has a corresponding passing test (38 tests, all green). Plus a new v6→v7
+migration test proving the ledger backfill is lossless against a hand-built
+legacy database with real in-flight RESERVED/USED coupons.
+
+### Known gap in this pass
+No participant-coupon assignment in the **Walk-in/Advance creation wizard**
+itself (only in the post-creation detail modal) — the wizard attaches at most
+one coupon at reservation-level during creation; assigning a specific coupon
+to a specific named participant, or attaching a second coupon, happens after
+creation via `ReservationDetailModal`. This was a deliberate scope choice to
+keep the creation flow fast or staff (Part 18's "don't overcomplicate the
+common case") while still fully supporting the richer flows where they matter.
+
+## 11. Known gaps / not done
 
 * Everything in §1 marked NOT RUN. Highest risk: first real `npm run build`
   and first launch of the new screens.
@@ -271,7 +368,15 @@ attach/detach test with players=2 and differing campaign vs. per-player prices).
   (players/notes/time change = cancel + rebook, or reschedule via service).
 * Coupon totals on the existing Dashboard/Campaign/Sponsor pages count RESERVED
   coupons in the total but not under Available/Used/Expired/Revoked (so those four
-  can sum to less than the total while bookings hold coupons).
+  can sum to less than the total while bookings hold coupons) — with coverage>1
+  this also means a partially-used coupon still shows as AVAILABLE in those lists,
+  which is correct per §10's cache semantics but worth knowing when reading reports.
 * Rebrand is text/logo/hero only — no beach imagery, illustrations, new icon or
   installer artwork.
 * Timezone = machine local time; changing the PC clock/zone changes what "today" is.
+* No participant-coupon assignment in the Walk-in/Advance creation wizard itself
+  (only post-creation, via the reservation detail modal) — see §10's "Known gap
+  in this pass" note.
+* `qr.reserved_override` has no dedicated IPC channel/button yet — `confirmUse`
+  supports the flag and permission exists, but nothing in the UI calls it (by
+  design, per §4 — no casual "force use" button).

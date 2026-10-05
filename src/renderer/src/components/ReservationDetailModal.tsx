@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { LogIn, Play, BadgeCheck, XCircle, UserX, CreditCard, Ticket, Unlink } from 'lucide-react';
-import type { ReservationWithDetails, ReservationHistoryEntry } from '@shared/types/domain';
+import { LogIn, Play, BadgeCheck, XCircle, UserX, CreditCard, Ticket, Unlink, Users } from 'lucide-react';
+import type { ReservationWithDetails, ReservationHistoryEntry, ReservationPriceBreakdown, ReservationParticipant } from '@shared/types/domain';
 import { Modal } from '@/components/ui/Modal';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { PageSpinner } from '@/components/ui/Spinner';
@@ -32,19 +32,28 @@ export function ReservationDetailModal({
   const { can } = useAuth();
   const { formatMoney } = useSettings();
   const [r, setR] = useState<ReservationWithDetails | null>(null);
+  const [breakdown, setBreakdown] = useState<ReservationPriceBreakdown | null>(null);
+  const [participants, setParticipants] = useState<ReservationParticipant[]>([]);
   const [history, setHistory] = useState<ReservationHistoryEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<Pending>(null);
   const [reason, setReason] = useState('');
   const [couponCode, setCouponCode] = useState('');
+  const [couponParticipantId, setCouponParticipantId] = useState<number | null>(null);
+  const [showParticipants, setShowParticipants] = useState(false);
 
   const load = useCallback(async () => {
-    const [res, hist] = await Promise.all([
+    const [res, bd, hist, parts] = await Promise.all([
       window.api.reservations.get(reservationId),
+      window.api.reservations.priceBreakdown(reservationId),
       window.api.reservations.history(reservationId),
+      window.api.reservations.listParticipants(reservationId),
     ]);
     setR(res);
+    setBreakdown(bd);
     setHistory(hist);
+    setParticipants(parts);
+    if (parts.length > 0) setShowParticipants(true);
   }, [reservationId]);
 
   useEffect(() => {
@@ -95,41 +104,83 @@ export function ReservationDetailModal({
           <Info label="Date" value={prettyDate(r.reservationDate)} />
           <Info label="Time" value={`${r.startTime} · ${r.durationMin} min${r.periodName ? ` · ${r.periodName}` : ''}`} />
           <Info label="Players" value={String(r.players)} />
-          <Info label="Coupon" value={r.couponCode ?? '—'} mono />
         </div>
 
-        <div className="rounded-lg border border-base-border bg-base-surface2/50 p-3">
-          <Row label="Base price" value={formatMoney(r.basePriceCents)} />
-          {r.discountCents > 0 && <Row label="Coupon discount" value={`− ${formatMoney(r.discountCents)}`} />}
-          <Row label="Total" value={formatMoney(r.finalPriceCents)} strong />
-        </div>
+        {/* Price breakdown — Players, subtotal, one line per coupon, total discount, final total */}
+        {breakdown && (
+          <div className="rounded-lg border border-base-border bg-base-surface2/50 p-3">
+            <Row label={`Subtotal (${breakdown.players} × ${formatMoney(breakdown.pricePerPlayerCents)})`} value={formatMoney(breakdown.subtotalCents)} />
+            {breakdown.coupons.map((c) => (
+              <div key={c.couponId} className="flex items-start justify-between gap-2 border-t border-base-border/60 py-1.5 text-xs">
+                <div>
+                  <p className="font-mono text-cyan">{c.couponCode}{c.participantName ? ` · ${c.participantName}` : ''}</p>
+                  <p className="text-gray-500">{c.sponsorName} — covers {c.coverageConsumed} player{c.coverageConsumed > 1 ? 's' : ''} · eligible {formatMoney(c.eligibleAmountCents)}</p>
+                </div>
+                <div className="flex items-center gap-2 whitespace-nowrap">
+                  <span className="text-danger">− {formatMoney(c.discountCents)}</span>
+                  {active && !paid && can('reservations.edit') && (
+                    <button className="text-gray-500 hover:text-danger" title="Remove this coupon" disabled={busy} onClick={() => run('Coupon removed', () => window.api.reservations.detachCoupon(r.id, c.couponId))}>
+                      <Unlink size={14} />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {breakdown.totalDiscountCents > 0 && (
+              <Row label="Total discount" value={`− ${formatMoney(breakdown.totalDiscountCents)}`} />
+            )}
+            <Row label="Final Total" value={formatMoney(breakdown.finalPriceCents)} strong />
+          </div>
+        )}
 
         {r.notes && <p className="rounded-lg bg-base-surface2/50 p-3 text-gray-300">{r.notes}</p>}
         {r.cancelReason && <p className="text-xs text-gray-500">Reason: {r.cancelReason}</p>}
 
-        {active && !paid && can('reservations.edit') && (
-          <div className="flex items-end gap-2">
-            {r.couponId ? (
-              <button className="btn-secondary" disabled={busy} onClick={() => run('Coupon released', () => window.api.reservations.detachCoupon(r.id))}>
-                <Unlink size={15} /> Remove coupon
+        {active && !paid && can('reservations.edit') && breakdown && breakdown.uncoveredPlayers > 0 && (
+          <div className="space-y-2">
+            <div className="flex items-end gap-2">
+              <div className="flex-1">
+                <label className="label">Attach a coupon ({breakdown.uncoveredPlayers} player{breakdown.uncoveredPlayers > 1 ? 's' : ''} not yet covered)</label>
+                <input className="input font-mono" value={couponCode} onChange={(e) => setCouponCode(e.target.value)} placeholder="e.g. SPONSOR-AB123" />
+              </div>
+              {participants.length > 0 && (
+                <select className="input w-auto" value={couponParticipantId ?? ''} onChange={(e) => setCouponParticipantId(e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">Whole booking</option>
+                  {participants.filter((p) => p.name).map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              )}
+              <button
+                className="btn-secondary"
+                disabled={busy || !couponCode.trim()}
+                onClick={() =>
+                  run('Coupon reserved for this booking', () =>
+                    window.api.reservations.attachCoupon(r.id, couponCode.trim(), couponParticipantId ? { participantId: couponParticipantId } : undefined)
+                  ).then(() => setCouponCode(''))
+                }
+              >
+                <Ticket size={15} /> Attach
               </button>
-            ) : (
-              <>
-                <div className="flex-1">
-                  <label className="label">Attach coupon code</label>
-                  <input className="input font-mono" value={couponCode} onChange={(e) => setCouponCode(e.target.value)} placeholder="e.g. SPONSOR-AB123" />
-                </div>
-                <button
-                  className="btn-secondary"
-                  disabled={busy || !couponCode.trim()}
-                  onClick={() => run('Coupon reserved for this booking', () => window.api.reservations.attachCoupon(r.id, couponCode.trim()))}
-                >
-                  <Ticket size={15} /> Attach
-                </button>
-              </>
-            )}
+            </div>
           </div>
         )}
+
+        {/* Optional participant names — never required (Part 5/11) */}
+        <div>
+          <button className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-200" onClick={() => setShowParticipants((v) => !v)}>
+            <Users size={13} /> Participant details {participants.some((p) => p.name) ? `(${participants.filter((p) => p.name).length}/${r.players} named)` : '(optional)'}
+          </button>
+          {showParticipants && (
+            <ParticipantEditor
+              reservationId={r.id}
+              players={r.players}
+              participants={participants}
+              editable={active && can('reservations.edit')}
+              onSaved={load}
+            />
+          )}
+        </div>
 
         <div className="flex flex-wrap gap-2 border-t border-base-border pt-4">
           {r.status === 'CONFIRMED' && can('reservations.checkin') && (
@@ -195,8 +246,8 @@ export function ReservationDetailModal({
         <ConfirmDialog
           title="Mark as paid?"
           message={
-            r.couponCode
-              ? `Records payment of ${formatMoney(r.finalPriceCents)}. The reserved coupon ${r.couponCode} will be marked as used automatically — no extra step.`
+            breakdown && breakdown.coupons.length > 0
+              ? `Records payment of ${formatMoney(breakdown.finalPriceCents)}. ${breakdown.coupons.length > 1 ? 'The reserved coupons' : 'The reserved coupon'} ${breakdown.coupons.map((c) => c.couponCode).join(', ')} will be marked as used automatically — no extra step.`
               : `Records payment of ${formatMoney(r.finalPriceCents)}.`
           }
           confirmLabel="Mark as paid"
@@ -222,6 +273,64 @@ export function ReservationDetailModal({
         />
       )}
     </Modal>
+  );
+}
+
+/** Optional, collapsible participant names (Part 5/11 of the spec) — a
+ * reservation works identically whether zero, some, or all players are
+ * named. Never forces staff to fill every slot. */
+function ParticipantEditor({
+  reservationId,
+  players,
+  participants,
+  editable,
+  onSaved,
+}: {
+  reservationId: number;
+  players: number;
+  participants: ReservationParticipant[];
+  editable: boolean;
+  onSaved: () => void;
+}) {
+  const toast = useToast();
+  const [names, setNames] = useState<string[]>(
+    Array.from({ length: players }, (_, i) => participants[i]?.name ?? '')
+  );
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await window.api.reservations.setParticipants(reservationId, names.map((n) => n.trim() || null));
+      toast.show('success', 'Participant details saved');
+      onSaved();
+    } catch (e) {
+      toast.show('error', e instanceof Error ? e.message : 'Could not save participants');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-2 space-y-2 rounded-lg border border-base-border bg-base-surface2/40 p-3">
+      {names.map((name, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <span className="w-16 shrink-0 text-xs text-gray-500">Player {i + 1}</span>
+          <input
+            className="input !py-1 text-sm"
+            placeholder="Name (optional)"
+            value={name}
+            disabled={!editable}
+            onChange={(e) => setNames((prev) => prev.map((n, idx) => (idx === i ? e.target.value : n)))}
+          />
+        </div>
+      ))}
+      {editable && (
+        <button className="btn-secondary !py-1.5 text-xs" disabled={busy} onClick={save}>
+          Save names
+        </button>
+      )}
+    </div>
   );
 }
 

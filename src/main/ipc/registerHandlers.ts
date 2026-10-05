@@ -201,6 +201,7 @@ export function registerIpcHandlers(ctx: AppContext): void {
     svc().coupons.revokeMany(ids, reason)
   );
   safeHandle(IPC.COUPON_GET_QR, 'qr.view', (code: string) => generateQrDataUrl(code));
+  safeHandle(IPC.COUPON_COVERAGE_STATE, 'qr.view', (couponId: number) => svc().coupons.coverageState(couponId));
 
   // ---------- History ----------
   safeHandle(IPC.HISTORY_LIST, 'reports.view', (params: Parameters<HistoryService['list']>[0]) => svc().history.list(params));
@@ -413,14 +414,29 @@ export function registerIpcHandlers(ctx: AppContext): void {
       return svc().reservations.rescheduleToAdvance({ ...params, actorUserId: session?.userId ?? null });
     }
   );
-  safeHandle(IPC.RESERVATION_ATTACH_COUPON, 'reservations.edit', (id: number, couponCode: string) => {
+  // A reservation may carry MULTIPLE coupons (coverage can be split across
+  // players/participants) — attach/detach operate per-coupon, not per-reservation.
+  safeHandle(
+    IPC.RESERVATION_ATTACH_COUPON,
+    'reservations.edit',
+    (id: number, couponCode: string, options?: { participantId?: number | null; coverage?: number }) => {
+      const session = getCurrentSession();
+      return svc().reservations.attachCoupon(id, couponCode, session?.userId ?? null, options);
+    }
+  );
+  safeHandle(IPC.RESERVATION_DETACH_COUPON, 'reservations.edit', (id: number, couponId: number) => {
     const session = getCurrentSession();
-    return svc().reservations.attachCoupon(id, couponCode, session?.userId ?? null);
+    return svc().reservations.detachCoupon(id, couponId, session?.userId ?? null);
   });
-  safeHandle(IPC.RESERVATION_DETACH_COUPON, 'reservations.edit', (id: number) => {
-    const session = getCurrentSession();
-    return svc().reservations.detachCoupon(id, session?.userId ?? null);
-  });
+  safeHandle(IPC.RESERVATION_PRICE_BREAKDOWN, 'reservations.view', (id: number) =>
+    svc().reservations.getPriceBreakdown(id)
+  );
+  safeHandle(IPC.RESERVATION_LIST_PARTICIPANTS, 'reservations.view', (id: number) =>
+    svc().reservations.listParticipants(id)
+  );
+  safeHandle(IPC.RESERVATION_SET_PARTICIPANTS, 'reservations.edit', (id: number, names: Array<string | null>) =>
+    svc().reservations.setParticipants(id, names)
+  );
   safeHandle(IPC.RESERVATION_CHECKIN, 'reservations.checkin', (id: number) => {
     const session = getCurrentSession();
     return svc().reservations.checkIn(id, session?.userId ?? null);

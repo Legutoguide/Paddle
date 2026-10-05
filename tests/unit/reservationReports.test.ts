@@ -96,9 +96,9 @@ describe('ReservationReportService — dashboard & reports from real data', () =
     assert.equal(r.total, 2);
     assert.equal(r.paid, 1);
     assert.equal(r.unpaid, 1);
-    assert.equal(r.revenueCents, 8000);
+    assert.equal(r.revenueCents, 18000); // base 20000 (2 players x 10000/player) - 2000 discount
     assert.equal(r.unpaidCents, 10000);
-    assert.equal(r.discountCents, 2000);
+    assert.equal(r.discountCents, 2000); // coupon coverage defaults to 1 player: 10000 eligible x 20%
     assert.equal(r.couponReservations, 1);
     assert.equal(r.averagePlayers, 1.5);
     assert.equal(r.popularTimes[0].label, '10:00');
@@ -109,7 +109,7 @@ describe('ReservationReportService — dashboard & reports from real data', () =
     assert.equal(sp.sponsorName, 'Beach Co');
     assert.equal(sp.couponsUsed, 1);
     assert.equal(sp.discountCents, 2000);
-    assert.equal(sp.revenueCents, 8000);
+    assert.equal(sp.revenueCents, 18000);
   });
 
   test('completed reservations still count toward slot occupancy', () => {

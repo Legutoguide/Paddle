@@ -11,387 +11,465 @@ import { CampaignService } from '../../src/main/services/campaignService';
 
 const TEST_DATE = futureSunday();
 
-describe('Coupon <-> Reservation integration (atomic payment rule)', () => {
-  let db: Database.Database;
-  let coupons: CouponService;
-  let reservations: ReservationService;
-  let couponCode: string;
+/** Shared fixture: 30 TND/player pricing, a sponsor, and a helper to mint a
+ * coupon with a given coverage (defaults to 1) and discount (defaults 50%),
+ * matching the user's own A1-style example throughout. */
+function setupFixture() {
+  const db = createTestDb();
+  const coupons = new CouponService(db);
+  const reservations = new ReservationService(db, coupons);
+  new PricingService(db).create({ name: 'Standard hour', weekdayMask: 127, durationMin: 60, priceCents: 3000 }); // 30 TND/player
+  const sponsor = new SponsorService(db).create({ name: 'Beach Co' });
+  const campaigns = new CampaignService(db);
 
-  beforeEach(() => {
-    db = createTestDb();
-    coupons = new CouponService(db);
-    // ReservationService MUST share the same CouponService instance the
-    // rest of the app uses — this mirrors registerHandlers.ts's svc()
-    // wiring exactly, and matters because both need to see the same
-    // in-flight coupon state within one transaction.
-    reservations = new ReservationService(db, coupons);
-    new PricingService(db).create({ name: 'Standard hour', weekdayMask: 127, durationMin: 60, priceCents: 10000 });
-
-    const sponsors = new SponsorService(db);
-    const campaigns = new CampaignService(db);
-    const sponsor = sponsors.create({ name: 'Beach Co' });
+  const makeCoupon = (coveragePlayers = 1, discountPercentage = 50, prefix = 'CPN') => {
     const campaign = campaigns.create({
       sponsorId: sponsor.id,
-      campaignName: 'Autumn Promo',
+      campaignName: `${coveragePlayers}-Player Coupon`,
       serviceName: '1 Hour Board',
-      originalPrice: 100,
-      discountPercentage: 20,
+      originalPrice: 30, // display-only now — never used in reservation pricing math
+      discountPercentage,
+      coveragePlayers,
     });
-    const [coupon] = coupons.generateCodes({ campaignId: campaign.id, count: 1, prefix: 'AUTUMN' });
-    couponCode = coupon.code;
-  });
+    return coupons.generateCodes({ campaignId: campaign.id, count: 1, prefix })[0].code;
+  };
 
-  test('attaching a coupon at reservation creation moves it AVAILABLE -> RESERVED and applies the discount', () => {
+  return { db, coupons, reservations, sponsor, campaigns, makeCoupon };
+}
+
+// ============================================================================
+// PRICE TESTS — covered exhaustively in reservationService.test.ts's
+// "Per-player pricing" suite (1/2/3/4 players x 30 TND/player). Not repeated
+// here; this file focuses on coupon coverage math layered on top.
+// ============================================================================
+
+describe('COUPON COVERAGE — discount applies only to the covered slice, never the whole reservation', () => {
+  test('4 players + 1-player coupon (50% off): eligible=30, discount=15, total=105', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
     const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00',
+      durationMin: 60, players: 4, couponCode: code,
     });
-    assert.equal(r.basePriceCents, 10000);
-    assert.equal(r.discountCents, 2000);
-    assert.equal(r.finalPriceCents, 8000);
-
-    const coupon = coupons.getByCode(couponCode)!;
-    assert.equal(coupon.status, 'RESERVED');
-    assert.equal(coupon.reservationId, r.id);
+    assert.equal(r.basePriceCents, 12000); // 4 x 3000
+    assert.equal(r.discountCents, 1500); // 1 x 3000 x 50%
+    assert.equal(r.finalPriceCents, 10500); // NEVER 12000 x 50% = 6000
   });
 
-  test('a RESERVED coupon cannot be attached to a second reservation', () => {
-    reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
+  test('4 players + 2-player coupon (50% off): eligible=60, discount=30, total=90', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(2, 50);
+    const r = reservations.createAdvance({
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00',
+      durationMin: 60, players: 4, couponCode: code,
     });
+    assert.equal(r.discountCents, 3000);
+    assert.equal(r.finalPriceCents, 9000);
+  });
+
+  test('4 players + 3-player coupon (50% off): eligible=90, discount=45, total=75', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(3, 50);
+    const r = reservations.createAdvance({
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00',
+      durationMin: 60, players: 4, couponCode: code,
+    });
+    assert.equal(r.discountCents, 4500);
+    assert.equal(r.finalPriceCents, 7500);
+  });
+
+  test('4 players + 4-player coupon (50% off): eligible=120, discount=60, total=60', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(4, 50);
+    const r = reservations.createAdvance({
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00',
+      durationMin: 60, players: 4, couponCode: code,
+    });
+    assert.equal(r.discountCents, 6000);
+    assert.equal(r.finalPriceCents, 6000);
+  });
+
+  test("the A1 example exactly: 30 TND coupon, 50% off, used on a 4-player booking must NOT discount the full 120 TND", () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50); // "A1": covers 1 player, 50% off
+    const r = reservations.createAdvance({
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00',
+      durationMin: 60, players: 4, couponCode: code,
+    });
+    assert.notEqual(r.finalPriceCents, 6000, 'must never be 120 x 50%');
+    assert.equal(r.finalPriceCents, 10500);
+  });
+});
+
+describe('PARTIAL USAGE — a multi-player coupon can be used across separate reservations', () => {
+  test('2-player coupon: use 1 -> remaining 1; use 1 again -> remaining 0; a third attempt is rejected', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(2, 50);
+    const couponId = coupons.getByCode(code)!.id;
+
+    const r1 = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 1);
+    assert.equal(r1.discountCents, 1500); // 1 unit x 3000 x 50%
+
+    const r2 = reservations.createAdvance({ customer: { name: 'B', phone: '2' }, reservationDate: TEST_DATE, startTime: '10:00', durationMin: 60, players: 1, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 0);
+    assert.equal(r2.discountCents, 1500);
+
     assert.throws(
-      () =>
-        reservations.createAdvance({
-          customer: { name: 'Sara', phone: '20999888' },
-          reservationDate: TEST_DATE,
-          startTime: '11:00',
-          durationMin: 60,
-          players: 1,
-          couponCode,
-        }),
+      () => reservations.createAdvance({ customer: { name: 'C', phone: '3' }, reservationDate: TEST_DATE, startTime: '11:00', durationMin: 60, players: 1, couponCode: code }),
       CouponConflictError
     );
   });
 
-  test('Scan & Validate sees a RESERVED coupon as RESERVED, not AVAILABLE — and does not consume it', () => {
+  test('2-player coupon used for all 2 players in ONE reservation fully consumes it immediately', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(2, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 0);
+  });
+
+  test('4-player coupon: 1+1+1+1 across four separate reservations', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(4, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    const times = ['09:00', '10:00', '11:00', '12:00'];
+    for (const t of times) {
+      reservations.createAdvance({ customer: { name: `P-${t}`, phone: t }, reservationDate: TEST_DATE, startTime: t, durationMin: 60, players: 1, couponCode: code });
+    }
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 0);
+    assert.throws(() =>
+      reservations.createAdvance({ customer: { name: 'Overflow', phone: '99' }, reservationDate: TEST_DATE, startTime: '13:00', durationMin: 60, players: 1, couponCode: code })
+    );
+  });
+
+  test('4-player coupon: 2+2 across two reservations', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(4, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 2);
+    reservations.createAdvance({ customer: { name: 'B', phone: '2' }, reservationDate: TEST_DATE, startTime: '10:00', durationMin: 60, players: 2, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 0);
+  });
+
+  test('4-player coupon: 1+3 across two reservations', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(4, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 3);
+    reservations.createAdvance({ customer: { name: 'B', phone: '2' }, reservationDate: TEST_DATE, startTime: '10:00', durationMin: 60, players: 3, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 0);
+  });
+
+  test('a coupon with MORE coverage than a reservation has players is capped, not rejected (partial grant)', () => {
+    // A 4-player coupon attached to a 2-player booking should only consume
+    // 2 units of coverage, leaving 2 remaining for a future booking — this
+    // is the "assign a 4-player coupon to 2 players" case: the system caps
+    // it rather than ever discounting more than this reservation's players.
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(4, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2, couponCode: code });
+    assert.equal(r.discountCents, 3000); // 2 units x 3000 x 50%, not 4 units
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 2);
+  });
+});
+
+describe('MULTIPLE COUPONS on one reservation', () => {
+  test('4 players + two different 1-player coupons: each discounts independently, no double-counting', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const codeA = makeCoupon(1, 50, 'A1');
+    const codeB = makeCoupon(1, 50, 'B1');
     const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4, couponCode: codeA,
     });
-    const result = coupons.validate(couponCode);
+    const attached = reservations.attachCoupon(r.id, codeB);
+    assert.equal(attached.discountCents, 3000); // 1500 + 1500
+    assert.equal(attached.finalPriceCents, 9000); // 12000 - 3000
+  });
+
+  test('a second coupon can only cover players not already covered by the first', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const codeA = makeCoupon(4, 50, 'A4'); // covers all 4 by itself
+    const codeB = makeCoupon(1, 50, 'B1');
+    const r = reservations.createAdvance({
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4, couponCode: codeA,
+    });
+    assert.equal(r.discountCents, 6000); // all 4 players covered
+    // No uncovered players remain, so attaching a second coupon must be rejected.
+    assert.throws(() => reservations.attachCoupon(r.id, codeB), ReservationConflictError);
+  });
+
+  test('getPriceBreakdown lists one line per coupon, matching Part 10 of the spec', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const codeA = makeCoupon(1, 50, 'A1');
+    const codeB = makeCoupon(2, 50, 'A2');
+    const r = reservations.createAdvance({
+      customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4, couponCode: codeA,
+    });
+    reservations.attachCoupon(r.id, codeB);
+    const breakdown = reservations.getPriceBreakdown(r.id);
+    assert.equal(breakdown.subtotalCents, 12000);
+    assert.equal(breakdown.coupons.length, 2);
+    assert.equal(breakdown.coupons[0].eligibleAmountCents, 3000);
+    assert.equal(breakdown.coupons[0].discountCents, 1500);
+    assert.equal(breakdown.coupons[1].eligibleAmountCents, 6000);
+    assert.equal(breakdown.coupons[1].discountCents, 3000);
+    assert.equal(breakdown.totalDiscountCents, 4500);
+    assert.equal(breakdown.finalPriceCents, 7500);
+    assert.equal(breakdown.uncoveredPlayers, 1); // 4 - 1 - 2
+  });
+});
+
+describe('SECURITY / ANTI-FRAUD', () => {
+  test('a fully consumed coupon cannot be reused', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    reservations.markAsPaid(r.id); // RESERVED -> CONSUMED, 0 remaining
+    assert.throws(() =>
+      reservations.createAdvance({ customer: { name: 'B', phone: '2' }, reservationDate: TEST_DATE, startTime: '10:00', durationMin: 60, players: 1, couponCode: code })
+    );
+  });
+
+  test('remaining coverage can never go negative no matter how many attempts are made', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(2, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2, couponCode: code });
+    for (let i = 0; i < 5; i++) {
+      assert.throws(() =>
+        reservations.createAdvance({ customer: { name: `X${i}`, phone: `${i}` }, reservationDate: TEST_DATE, startTime: `1${i}:00`, durationMin: 60, players: 1, couponCode: code })
+      );
+    }
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 0, 'never negative, never re-grantable');
+  });
+
+  test('the same coupon cannot be attached twice to the same reservation (even with uncovered players remaining)', () => {
+    // coverage=2 on a 4-player reservation leaves 2 players uncovered, so a
+    // RE-attach attempt isn't blocked by "all players covered" — it must be
+    // blocked specifically because this exact coupon is already attached.
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(2, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4, couponCode: code });
+    assert.throws(() => reservations.attachCoupon(r.id, code), CouponConflictError);
+  });
+
+  test('a coupon whose coverage exactly matches all remaining uncovered players, attached again, is blocked by the reservation-level guard instead', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(4, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4, couponCode: code });
+    assert.throws(() => reservations.attachCoupon(r.id, code), ReservationConflictError);
+  });
+
+  test('an expired coupon cannot be used, even if not yet swept', () => {
+    const { db, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    db.prepare(`UPDATE coupons SET expires_at = '2020-01-01T00:00:00.000Z' WHERE code = ?`).run(code);
+    assert.throws(() =>
+      reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code })
+    );
+  });
+
+  test('a revoked coupon cannot be used', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    coupons.revoke(coupons.getByCode(code)!.id, 'fraud');
+    assert.throws(() =>
+      reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code })
+    );
+  });
+
+  test('a RESERVED coupon cannot be revoked — it would orphan the reservation', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    assert.throws(() => coupons.revoke(coupons.getByCode(code)!.id, 'oops'));
+  });
+
+  test('Scan & Validate shows a RESERVED coupon as RESERVED (never AVAILABLE) and never consumes it on scan', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'Amir', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    const result = coupons.validate(code);
     assert.equal(result.outcome, 'RESERVED');
     if (result.outcome === 'RESERVED') {
-      assert.equal(result.reservation.id, r.id);
+      assert.equal(result.reservations.length, 1);
+      assert.equal(result.reservations[0].id, r.id);
     }
-    // Still RESERVED after validation — scanning must never change status.
-    assert.equal(coupons.getByCode(couponCode)!.status, 'RESERVED');
+    assert.equal(coupons.getByCode(code)!.status, 'RESERVED', 'scanning must never change status');
   });
 
-  test('normal confirmUse() refuses a RESERVED coupon with a clear conflict message', () => {
-    reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-    assert.throws(() => coupons.confirmUse(couponCode, 'cashier1'), CouponConflictError);
-    assert.equal(coupons.getByCode(couponCode)!.status, 'RESERVED', 'a failed confirmUse must not change status');
-  });
+  test('normal confirmUse() refuses a RESERVED coupon; CEO override consumes it and is audited distinctly', () => {
+    const { coupons, db, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    reservations.createAdvance({ customer: { name: 'Amir', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    assert.throws(() => coupons.confirmUse(code, 'cashier1'), CouponConflictError);
 
-  test('CEO-only override CAN consume a RESERVED coupon, releases it from the reservation, and is audited distinctly', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-    const { coupon } = coupons.confirmUse(couponCode, 'ceo-override', { allowReservedOverride: true });
+    const { coupon } = coupons.confirmUse(code, 'ceo', { allowReservedOverride: true });
     assert.equal(coupon.status, 'USED');
-
-    // The reservation itself is untouched in status, but its coupon link is
-    // cleared since the coupon was taken from it, not consumed via payment.
-    const reloaded = reservations.getById(r.id)!;
-    assert.equal(reloaded.couponId, null);
-
-    const auditLog = db
-      .prepare(`SELECT * FROM audit_logs WHERE action = 'COUPON_RESERVED_OVERRIDE' AND entity_id = ?`)
-      .get(coupon.id);
-    assert.ok(auditLog, 'override use must be audited distinctly from a normal COUPON_USED entry');
+    const auditRow = db.prepare(`SELECT * FROM audit_logs WHERE action = 'COUPON_RESERVED_OVERRIDE'`).get();
+    assert.ok(auditRow, 'override must be audited distinctly');
   });
 
-  test('cancelling a reservation releases its RESERVED coupon back to AVAILABLE', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-    reservations.cancel(r.id, 'customer cancelled');
-    assert.equal(coupons.getByCode(couponCode)!.status, 'AVAILABLE');
-    assert.equal(coupons.getByCode(couponCode)!.reservationId, null);
-  });
-
-  test('a no-show also releases its RESERVED coupon back to AVAILABLE', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-    reservations.noShow(r.id);
-    assert.equal(coupons.getByCode(couponCode)!.status, 'AVAILABLE');
-  });
-
-  test('THE KEY RULE: markAsPaid atomically moves payment -> PAID and coupon RESERVED -> USED in one click', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-    const paid = reservations.markAsPaid(r.id);
-    assert.equal(paid.paymentStatus, 'PAID');
-    assert.ok(paid.paidAt);
-
-    const coupon = coupons.getByCode(couponCode)!;
-    assert.equal(coupon.status, 'USED', 'coupon must be consumed automatically — no separate "use coupon" step');
-
-    // Exactly one usage_history row must exist for this coupon.
-    const historyCount = (
-      db.prepare(`SELECT COUNT(*) as c FROM usage_history WHERE coupon_id = ?`).get(coupon.id) as { c: number }
-    ).c;
-    assert.equal(historyCount, 1);
-  });
-
-  test('markAsPaid is idempotent-safe: a second attempt is rejected, not double-processed', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-    reservations.markAsPaid(r.id);
-    assert.throws(() => reservations.markAsPaid(r.id), ReservationConflictError);
-  });
-
-  test('ATOMICITY: if coupon consumption fails mid-payment, the payment status rolls back too (never PAID+RESERVED)', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-
-    // Simulate a mid-transaction race: something external changes the
-    // coupon's status directly (bypassing normal APIs) between reservation
-    // creation and payment, so it's no longer RESERVED when
-    // consumeForReservation() runs inside markAsPaid's transaction — while
-    // the reservation record still points at it. This must cause the WHOLE
-    // transaction (including the payment_status write) to roll back.
-    db.prepare(`UPDATE coupons SET status = 'EXPIRED' WHERE code = ?`).run(couponCode);
-
-    assert.throws(() => reservations.markAsPaid(r.id), CouponConflictError);
-
-    const reloaded = reservations.getById(r.id)!;
-    assert.equal(
-      reloaded.paymentStatus,
-      'UNPAID',
-      'payment_status must have rolled back to UNPAID, not been left PAID with an inconsistent coupon state'
+  test('an invalid/unknown coupon code is rejected at reservation creation', () => {
+    const { reservations } = setupFixture();
+    assert.throws(() =>
+      reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: 'NOPE-404' })
     );
-    assert.equal(reloaded.paidAt, null);
   });
 
-  test('a reservation with no coupon pays normally with no coupon side effects', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'NoCoupon Nadia', phone: '20111222' },
-      reservationDate: TEST_DATE,
-      startTime: '12:00',
-      durationMin: 60,
-      players: 1,
-    });
+  test('SELF-HEALING: if a coupon is released behind the reservation\'s back before payment, markAsPaid charges the correct (non-discounted) amount instead of trusting a stale cached total', () => {
+    const { db, coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    assert.equal(r.finalPriceCents, 1500); // 3000 - 50%
+
+    // Simulate an external release the reservation's own cached columns
+    // don't yet know about.
+    db.prepare(`UPDATE coupon_redemptions SET status = 'RELEASED' WHERE coupon_id = ?`).run(coupons.getByCode(code)!.id);
+
     const paid = reservations.markAsPaid(r.id);
     assert.equal(paid.paymentStatus, 'PAID');
-    assert.equal(paid.couponId, null);
+    assert.equal(paid.discountCents, 0, 'the stale discount must not be charged');
+    assert.equal(paid.finalPriceCents, 3000, 'full per-player price once the coupon is no longer actually applied');
   });
 
-  test('attachCoupon / detachCoupon on an existing reservation before payment (players=2)', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 2,
-    });
-    assert.equal(r.couponId, null);
-    assert.equal(r.basePriceCents, 20000, 'no coupon yet: per-player rate (10000) x 2 players');
-
-    // The coupon's own campaign price (10000, from beforeEach) REPLACES the
-    // per-player total (20000) — it does not stack on top of it.
-    const withCoupon = reservations.attachCoupon(r.id, couponCode);
-    assert.equal(withCoupon.couponId, coupons.getByCode(couponCode)!.id);
-    assert.equal(withCoupon.basePriceCents, 10000, "base becomes the coupon's own package price, not 20000+discount");
-    assert.equal(withCoupon.finalPriceCents, 8000);
-    assert.equal(coupons.getByCode(couponCode)!.status, 'RESERVED');
-
-    // Detaching restores the per-player total, not the coupon's package price.
-    const detached = reservations.detachCoupon(r.id);
-    assert.equal(detached.couponId, null);
-    assert.equal(detached.basePriceCents, 20000, 'detach must restore the per-player rate x players, not leave the coupon price behind');
-    assert.equal(detached.finalPriceCents, 20000);
-    assert.equal(coupons.getByCode(couponCode)!.status, 'AVAILABLE');
-  });
-
-  test("a group-package coupon set at reservation creation is NOT multiplied by player count", () => {
-    // A campaign the business configured specifically as a "2 players" deal
-    // at 45 TND total — its own originalPriceCents must be used as-is.
-    const sponsor2 = new SponsorService(db).create({ name: 'Group Deals Co' });
-    const groupCampaign = new CampaignService(db).create({
-      sponsorId: sponsor2.id, campaignName: '2-Player Package', serviceName: '1 Hour for 2',
-      originalPrice: 45, discountPercentage: 10,
-    });
-    const groupCode = coupons.generateCodes({ campaignId: groupCampaign.id, count: 1, prefix: 'GRP2' })[0].code;
-
-    const r = reservations.createAdvance({
-      customer: { name: 'Sara', phone: '20999888' },
-      reservationDate: TEST_DATE,
-      startTime: '11:00',
-      durationMin: 60,
-      players: 2,
-      couponCode: groupCode,
-    });
-    // NOT 10000 (per-player rate) x 2 = 20000 — the coupon's own 4500 wins.
-    assert.equal(r.basePriceCents, 4500);
-    assert.equal(r.finalPriceCents, 4050); // 4500 - 10%
-  });
-
-  test('cannot attach or detach a coupon on an already-paid reservation', () => {
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-    });
+  test('ATOMICITY still holds: a genuinely attached coupon is always consumed in the SAME transaction as the payment, never left RESERVED on a PAID reservation', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
     reservations.markAsPaid(r.id);
-    assert.throws(() => reservations.attachCoupon(r.id, couponCode), ReservationConflictError);
+    assert.equal(coupons.getByCode(code)!.status, 'USED');
+    assert.notEqual(coupons.getByCode(code)!.status, 'RESERVED');
   });
 });
 
-describe('Coupon validity rules for reservations', () => {
-  let db: Database.Database;
-  let coupons: CouponService;
-  let reservations: ReservationService;
-  let couponId: number;
-  let code: string;
-
-  beforeEach(() => {
-    db = createTestDb();
-    coupons = new CouponService(db);
-    reservations = new ReservationService(db, coupons);
-    new PricingService(db).create({ name: 'Standard hour', weekdayMask: 127, durationMin: 60, priceCents: 10000 });
-    const sponsor = new SponsorService(db).create({ name: 'Beach Co' });
-    const campaign = new CampaignService(db).create({
-      sponsorId: sponsor.id, campaignName: 'Promo', serviceName: '1 Hour', originalPrice: 100, discountPercentage: 20,
-    });
-    const c = coupons.generateCodes({ campaignId: campaign.id, count: 1, prefix: 'V' })[0];
-    couponId = c.id;
-    code = c.code;
+describe('RESERVATION FLOWS', () => {
+  test('Walk-in with no coupon', () => {
+    const { reservations } = setupFixture();
+    const r = reservations.createWalkIn({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2 });
+    assert.equal(r.couponId, null);
+    assert.equal(r.finalPriceCents, 6000);
   });
 
-  const book = (couponCode?: string) =>
-    reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' },
-      reservationDate: TEST_DATE,
-      startTime: '10:00',
-      durationMin: 60,
-      players: 1,
-      couponCode,
-    });
-
-  test('an already-expired coupon (even if not yet swept) cannot be reserved', () => {
-    db.prepare(`UPDATE coupons SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?`).run(couponId);
-    assert.throws(() => book(code), /expired/i);
-    assert.equal(coupons.getById(couponId)!.status, 'AVAILABLE', 'failed attempt must not change the coupon');
-    assert.equal(reservations.list().length, 0, 'the failed booking must roll back entirely');
+  test('Walk-in with a coupon', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createWalkIn({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2, couponCode: code });
+    assert.equal(r.discountCents, 1500);
   });
 
-  test('a coupon that expires before the booking date is refused, one valid on that day is accepted', () => {
-    const before = new Date(); before.setDate(before.getDate() + 3);
-    db.prepare(`UPDATE coupons SET expires_at = ? WHERE id = ?`).run(before.toISOString(), couponId);
-    assert.throws(() => book(code), /before the reservation date/);
-
-    const after = new Date(`${TEST_DATE}T12:00:00`); after.setDate(after.getDate() + 5);
-    db.prepare(`UPDATE coupons SET expires_at = ? WHERE id = ?`).run(after.toISOString(), couponId);
-    assert.equal(book(code).couponId, couponId);
+  test('Advance reservation with a coupon, then markAsPaid consumes it atomically', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    const paid = reservations.markAsPaid(r.id);
+    assert.equal(paid.paymentStatus, 'PAID');
+    assert.equal(coupons.getByCode(code)!.status, 'USED');
   });
 
-  test('a RESERVED coupon cannot be revoked (single or bulk) — it would orphan the reservation', () => {
-    const r = book(code);
-    assert.throws(() => coupons.revoke(couponId, 'oops'), new RegExp(`reservation #${r.id}`));
-    const bulk = coupons.revokeMany([couponId], 'oops');
-    assert.equal(bulk.revoked.length, 0);
-    assert.match(bulk.skipped[0].why, /reserved/);
-    assert.equal(coupons.getById(couponId)!.status, 'RESERVED');
-    // ...and the booking can still be paid normally.
-    assert.equal(reservations.markAsPaid(r.id).paymentStatus, 'PAID');
+  test('Cancelling a reservation with a RESERVED coupon releases its coverage back', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(2, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 1);
+    reservations.cancel(r.id, 'changed plans');
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 2, 'fully released');
+  });
+
+  test('A no-show also releases coverage', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    reservations.noShow(r.id);
+    assert.equal(coupons.coverageState(couponId).remainingCoverage, 1);
+  });
+
+  test('the correct reservation owner can still pay and consume their reserved coupon after it was validated (not used) at Scan & Validate', () => {
+    const { coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'Amir', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    coupons.validate(code); // staff checks it at the counter — must not consume
+    const paid = reservations.markAsPaid(r.id);
+    assert.equal(paid.paymentStatus, 'PAID');
+    assert.equal(coupons.getByCode(code)!.status, 'USED');
+  });
+
+  test('optional participant names: a reservation works with none, some, or all named', () => {
+    const { reservations } = setupFixture();
+    const r = reservations.createWalkIn({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4 });
+    assert.deepEqual(reservations.listParticipants(r.id), []); // none named — perfectly valid
+
+    const named = reservations.setParticipants(r.id, ['Ahmed', null, 'Ali', null]);
+    assert.equal(named.length, 4);
+    assert.equal(named[0].name, 'Ahmed');
+    assert.equal(named[1].name, null);
+  });
+
+  test('a coupon can be assigned to a specific named participant', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const r = reservations.createAdvance({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2 });
+    const participants = reservations.setParticipants(r.id, ['Ahmed', 'Mohamed']);
+    reservations.attachCoupon(r.id, code, null, { participantId: participants[0].id });
+    const breakdown = reservations.getPriceBreakdown(r.id);
+    assert.equal(breakdown.coupons[0].participantName, 'Ahmed');
+  });
+
+  test('cannot name more participants than the reservation has players', () => {
+    const { reservations } = setupFixture();
+    const r = reservations.createWalkIn({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 2 });
+    assert.throws(() => reservations.setParticipants(r.id, ['A', 'B', 'C']));
+  });
+
+  test('rejects a booking that would exceed slot capacity even with a coupon attached', () => {
+    const { reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    reservations.createWalkIn({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 4 });
+    assert.throws(() =>
+      reservations.createWalkIn({ customer: { name: 'B', phone: '2' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code })
+    );
+  });
+
+  test('rescheduling a reservation to a new date transfers its coupon and reprices it at the new rate', () => {
+    const { db, coupons, reservations, makeCoupon } = setupFixture();
+    const code = makeCoupon(1, 50);
+    const couponId = coupons.getByCode(code)!.id;
+    const r = reservations.createWalkIn({ customer: { name: 'A', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    reservations.checkIn(r.id);
+
+    const newDate = futureSunday(21);
+    new PricingService(db).create({ name: 'Special day rate', weekdayMask: 127, durationMin: 60, priceCents: 5000, priority: 10 });
+    const moved = reservations.rescheduleToAdvance({ reservationId: r.id, reservationDate: newDate, startTime: '09:00', durationMin: 60 });
+    assert.equal(coupons.coverageState(couponId).activeRedemptions.length, 1);
+    assert.equal(coupons.coverageState(couponId).activeRedemptions[0].reservationId, moved.id);
+    assert.equal(moved.discountCents, 2500); // repriced at the new, higher-priority 5000/player rate: 5000 x 50%
+    assert.equal(reservations.getById(r.id)!.status, 'CANCELLED');
   });
 });
 
-describe('Danger Zone reset with reservation data', () => {
-  test('clears reservations, customers and history but keeps hours, periods and pricing rules', async () => {
+describe('Danger Zone reset with reservation + coverage data', () => {
+  test('clears reservations, customers, participants and the redemption ledger, keeps booking configuration', async () => {
+    const { db, reservations, makeCoupon } = setupFixture();
     const { DangerZoneService } = await import('../../src/main/services/dangerZoneService');
-    const db = createTestDb();
-    const coupons = new CouponService(db);
-    const reservations = new ReservationService(db, coupons);
-    new PricingService(db).create({ name: 'Standard hour', weekdayMask: 127, durationMin: 60, priceCents: 10000 });
-    const sponsor = new SponsorService(db).create({ name: 'Beach Co' });
-    const campaign = new CampaignService(db).create({
-      sponsorId: sponsor.id, campaignName: 'Promo', serviceName: '1 Hour', originalPrice: 100, discountPercentage: 20,
-    });
-    const code = coupons.generateCodes({ campaignId: campaign.id, count: 1, prefix: 'Z' })[0].code;
-    const r = reservations.createAdvance({
-      customer: { name: 'Amir', phone: '20123456' }, reservationDate: TEST_DATE, startTime: '10:00',
-      durationMin: 60, players: 1, couponCode: code,
-    });
+    const code = makeCoupon(2, 50);
+    const r = reservations.createAdvance({ customer: { name: 'Amir', phone: '1' }, reservationDate: TEST_DATE, startTime: '09:00', durationMin: 60, players: 1, couponCode: code });
+    reservations.setParticipants(r.id, ['Amir']);
     reservations.markAsPaid(r.id);
 
     const result = new DangerZoneService(db).resetAllData();
     assert.equal(result.reservationsRemoved, 1);
-    assert.equal(result.customersRemoved, 1);
 
     const count = (t: string) => (db.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as { c: number }).c;
-    for (const t of ['reservations', 'reservation_history', 'customers', 'coupons', 'campaigns', 'sponsors']) {
+    for (const t of ['reservations', 'reservation_participants', 'coupon_redemptions', 'customers', 'coupons', 'campaigns', 'sponsors']) {
       assert.equal(count(t), 0, `${t} must be empty after reset`);
     }
-    assert.equal(count('business_hours'), 7, 'business hours are configuration and must survive');
-    assert.equal(count('periods'), 4, 'periods must survive');
-    assert.equal(count('pricing_rules'), 1, 'pricing rules must survive');
+    assert.equal(count('business_hours'), 7);
+    assert.equal(count('pricing_rules'), 1);
   });
 });

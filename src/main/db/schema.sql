@@ -326,3 +326,60 @@ CREATE TABLE IF NOT EXISTS reservation_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_res_history_reservation ON reservation_history(reservation_id);
+
+-- ============================================================================
+-- PRIME PADDLE — Coupon coverage & participants (added schema v7)
+--
+-- A coupon's "coverage" is how many players its discount applies to (e.g. a
+-- 50%-off coupon covering 2 players discounts exactly 2 players' worth of
+-- the per-player price, never the whole reservation unless coverage happens
+-- to equal the player count). coverage_players lives on the CAMPAIGN (every
+-- coupon generated from it inherits the same coverage, read live via JOIN —
+-- never duplicated onto each coupon row, matching how discount fields
+-- already work for coupons today).
+--
+-- coupon_redemptions is a ledger, not a single FK: it is what makes PARTIAL
+-- coverage usage possible (e.g. a 2-player coupon used for 1 player on one
+-- reservation, then its remaining 1 player of coverage on a different
+-- reservation later), and what makes MULTIPLE coupons on one reservation
+-- possible. coupons.reservation_id (added in v6) is superseded by this
+-- table and is no longer written to by new code — kept only so existing
+-- rows are never silently lost; the v7 migration below backfills it into
+-- this ledger. "Remaining coverage" for a coupon is always computed live
+-- as `campaign.coverage_players - SUM(coverage_consumed) over this
+-- coupon's RESERVED/CONSUMED rows` — never stored, so it can't drift.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS reservation_participants (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  reservation_id  INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+  name            TEXT, -- optional — staff is never forced to name every player
+  sort_order      INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_participants_reservation ON reservation_participants(reservation_id);
+
+CREATE TABLE IF NOT EXISTS coupon_redemptions (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  coupon_id             INTEGER NOT NULL REFERENCES coupons(id) ON DELETE RESTRICT,
+  reservation_id        INTEGER NOT NULL REFERENCES reservations(id) ON DELETE RESTRICT,
+  participant_id        INTEGER REFERENCES reservation_participants(id) ON DELETE SET NULL,
+  coverage_consumed     INTEGER NOT NULL CHECK (coverage_consumed > 0),
+  eligible_amount_cents INTEGER NOT NULL CHECK (eligible_amount_cents >= 0),
+  discount_cents        INTEGER NOT NULL CHECK (discount_cents >= 0),
+  status                TEXT NOT NULL CHECK (status IN ('RESERVED','CONSUMED','RELEASED')),
+  actor_user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  consumed_at           TEXT,
+  released_at           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_redemptions_coupon ON coupon_redemptions(coupon_id);
+CREATE INDEX IF NOT EXISTS idx_redemptions_reservation ON coupon_redemptions(reservation_id);
+CREATE INDEX IF NOT EXISTS idx_redemptions_participant ON coupon_redemptions(participant_id);
+-- A participant can be linked to at most one ACTIVE coupon redemption, so
+-- the same player's slice is never discounted twice (Part 7's "no implicit
+-- stacking"). Partial index: only enforced for rows that are still live.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_redemptions_one_active_per_participant
+  ON coupon_redemptions(participant_id) WHERE participant_id IS NOT NULL AND status != 'RELEASED';

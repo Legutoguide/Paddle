@@ -29,6 +29,8 @@ export interface Campaign {
   discountPercentage: number;
   discountAmountCents: number;
   finalPriceCents: number;
+  /** How many players this campaign's coupons cover — see coupon_redemptions. */
+  coveragePlayers: number;
   totalCodes: number;
   imagePath: string | null;
   bannerPath: string | null;
@@ -125,7 +127,10 @@ export type ValidationResult =
   // A coupon locked to a future/pending reservation. Scanning it does NOT
   // consume it — it is validation-only. Normal flows must not be able to
   // redeem it for anything other than that specific reservation's payment.
-  | { outcome: 'RESERVED'; coupon: CouponWithDetails; reservation: ReservationSummary };
+  // A coupon's coverage can be split across more than one reservation (e.g.
+  // a 2-player coupon with 1 unit held by each of two different bookings),
+  // so every reservation currently holding a piece of it is listed.
+  | { outcome: 'RESERVED'; coupon: CouponWithDetails; reservations: ReservationSummary[] };
 
 export interface CouponWithDetails extends Coupon {
   sponsorName: string;
@@ -141,6 +146,8 @@ export interface CouponWithDetails extends Coupon {
   discountType: DiscountType;
   finalPriceCents: number;
   campaignStatus: CampaignStatus;
+  /** Inherited live from the campaign — how many players this coupon's discount can cover. */
+  coveragePlayers: number;
 }
 
 export interface DashboardStats {
@@ -291,7 +298,11 @@ export interface ReservationWithDetails extends Reservation {
   customerName: string;
   customerPhone: string;
   periodName: string | null;
+  /** Most recently attached coupon's code — a simple display value only.
+   * A reservation may have more than one coupon attached; see couponCount
+   * and fetch reservations.getPriceBreakdown() for the full picture. */
   couponCode: string | null;
+  couponCount: number;
 }
 
 export interface ReservationHistoryEntry {
@@ -376,4 +387,77 @@ export interface ReservationReport {
   revenueCents: number | null;
   unpaidCents: number | null;
   discountCents: number | null;
+}
+
+// ============================================================================
+// PRIME PADDLE — Coupon coverage, participants & multi-coupon reservations
+// (schema v7)
+// ============================================================================
+
+export type RedemptionStatus = 'RESERVED' | 'CONSUMED' | 'RELEASED';
+
+export interface ReservationParticipant {
+  id: number;
+  reservationId: number;
+  name: string | null; // optional — never forced
+  sortOrder: number;
+  createdAt: string;
+}
+
+export interface CouponRedemption {
+  id: number;
+  couponId: number;
+  reservationId: number;
+  participantId: number | null;
+  coverageConsumed: number;
+  eligibleAmountCents: number;
+  discountCents: number;
+  status: RedemptionStatus;
+  actorUserId: number | null;
+  createdAt: string;
+  consumedAt: string | null;
+  releasedAt: string | null;
+}
+
+/** Live-computed coverage state for one coupon — never stored, always
+ * derived from coupon_redemptions so it can never drift. */
+export interface CouponCoverageState {
+  couponId: number;
+  coveragePlayers: number;
+  consumedCoverage: number; // sum of RESERVED + CONSUMED rows
+  remainingCoverage: number; // coveragePlayers - consumedCoverage, floored at 0
+  activeRedemptions: Array<{
+    reservationId: number;
+    coverageConsumed: number;
+    status: RedemptionStatus;
+    reservationDate: string;
+    startTime: string;
+    customerName: string;
+    reservationStatus: ReservationStatus;
+  }>;
+}
+
+/** One line of a reservation's price breakdown — one per attached coupon. */
+export interface ReservationCouponLine {
+  couponId: number;
+  couponCode: string;
+  sponsorName: string;
+  campaignName: string;
+  participantId: number | null;
+  participantName: string | null;
+  coverageConsumed: number;
+  eligibleAmountCents: number;
+  discountCents: number;
+  status: RedemptionStatus;
+}
+
+export interface ReservationPriceBreakdown {
+  players: number;
+  pricePerPlayerCents: number;
+  subtotalCents: number; // pricePerPlayerCents x players
+  coupons: ReservationCouponLine[];
+  totalDiscountCents: number;
+  finalPriceCents: number;
+  /** Players not covered by any active coupon — informational, for staff. */
+  uncoveredPlayers: number;
 }

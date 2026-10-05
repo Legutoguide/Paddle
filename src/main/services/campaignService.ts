@@ -24,6 +24,9 @@ export interface CreateCampaignInput {
   startDate?: string | null;
   endDate?: string | null;
   notes?: string | null;
+  /** How many players a coupon generated from this campaign can cover.
+   * Defaults to 1 (the common case: one coupon, one player's discount). */
+  coveragePlayers?: number;
 }
 
 export class CampaignService {
@@ -44,6 +47,9 @@ export class CampaignService {
       throw new CampaignValidationError('Original price must be zero or greater');
     if (input.startDate && input.endDate && input.startDate > input.endDate) {
       throw new CampaignValidationError('Start date must be before end date');
+    }
+    if (input.coveragePlayers !== undefined && (!Number.isInteger(input.coveragePlayers) || input.coveragePlayers < 1)) {
+      throw new CampaignValidationError('Coverage must be a whole number of at least 1 player');
     }
     const sponsor = this.sponsors.getById(input.sponsorId);
     if (!sponsor) throw new SponsorNotFoundError(`Sponsor ${input.sponsorId} not found`);
@@ -66,8 +72,8 @@ export class CampaignService {
         `INSERT INTO campaigns
           (sponsor_id, campaign_name, service_name, duration, discount_type,
            original_price_cents, discount_percentage, discount_amount_cents,
-           final_price_cents, image_path, banner_path, start_date, end_date, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           final_price_cents, image_path, banner_path, start_date, end_date, notes, coverage_players)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.sponsorId,
@@ -83,7 +89,8 @@ export class CampaignService {
         input.bannerPath ?? null,
         input.startDate ?? null,
         input.endDate ?? null,
-        input.notes ?? null
+        input.notes ?? null,
+        input.coveragePlayers ?? 1
       );
 
     const id = Number(result.lastInsertRowid);
@@ -104,6 +111,9 @@ export class CampaignService {
   update(id: number, input: Partial<CreateCampaignInput>): Campaign {
     const existing = this.getById(id);
     if (!existing) throw new CampaignNotFoundError(`Campaign ${id} not found`);
+    if (input.coveragePlayers !== undefined && (!Number.isInteger(input.coveragePlayers) || input.coveragePlayers < 1)) {
+      throw new CampaignValidationError('Coverage must be a whole number of at least 1 player');
+    }
 
     const discountType = input.discountType ?? existing.discountType;
     const originalPriceCents =
@@ -119,12 +129,15 @@ export class CampaignService {
       discountAmountCents,
     });
 
+    const coveragePlayers = input.coveragePlayers ?? existing.coveragePlayers;
+
     this.db
       .prepare(
         `UPDATE campaigns SET
           campaign_name = ?, service_name = ?, duration = ?, discount_type = ?,
           original_price_cents = ?, discount_percentage = ?, discount_amount_cents = ?,
           final_price_cents = ?, image_path = ?, banner_path = ?, start_date = ?, end_date = ?, notes = ?,
+          coverage_players = ?,
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?`
       )
@@ -142,6 +155,7 @@ export class CampaignService {
         input.startDate !== undefined ? input.startDate : existing.startDate,
         input.endDate !== undefined ? input.endDate : existing.endDate,
         input.notes !== undefined ? input.notes : existing.notes,
+        coveragePlayers,
         id
       );
 

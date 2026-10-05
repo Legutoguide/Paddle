@@ -34,6 +34,7 @@ const api = {
     revoke: (id: number, reason?: string | null) => ipcRenderer.invoke(IPC.COUPON_REVOKE, id, reason),
     revokeMany: (ids: number[], reason?: string | null) => ipcRenderer.invoke(IPC.COUPON_REVOKE_MANY, ids, reason),
     getQr: (code: string) => ipcRenderer.invoke(IPC.COUPON_GET_QR, code),
+    coverageState: (couponId: number) => ipcRenderer.invoke(IPC.COUPON_COVERAGE_STATE, couponId),
   },
   history: {
     list: (params?: unknown) => ipcRenderer.invoke(IPC.HISTORY_LIST, params),
@@ -123,9 +124,13 @@ const api = {
     createAdvance: (input: unknown) => ipcRenderer.invoke(IPC.RESERVATION_CREATE_ADVANCE, input),
     rescheduleToAdvance: (params: unknown) =>
       ipcRenderer.invoke(IPC.RESERVATION_RESCHEDULE_TO_ADVANCE, params),
-    attachCoupon: (id: number, couponCode: string) =>
-      ipcRenderer.invoke(IPC.RESERVATION_ATTACH_COUPON, id, couponCode),
-    detachCoupon: (id: number) => ipcRenderer.invoke(IPC.RESERVATION_DETACH_COUPON, id),
+    attachCoupon: (id: number, couponCode: string, options?: { participantId?: number | null; coverage?: number }) =>
+      ipcRenderer.invoke(IPC.RESERVATION_ATTACH_COUPON, id, couponCode, options),
+    detachCoupon: (id: number, couponId: number) => ipcRenderer.invoke(IPC.RESERVATION_DETACH_COUPON, id, couponId),
+    priceBreakdown: (id: number) => ipcRenderer.invoke(IPC.RESERVATION_PRICE_BREAKDOWN, id),
+    listParticipants: (id: number) => ipcRenderer.invoke(IPC.RESERVATION_LIST_PARTICIPANTS, id),
+    setParticipants: (id: number, names: Array<string | null>) =>
+      ipcRenderer.invoke(IPC.RESERVATION_SET_PARTICIPANTS, id, names),
     checkIn: (id: number) => ipcRenderer.invoke(IPC.RESERVATION_CHECKIN, id),
     start: (id: number) => ipcRenderer.invoke(IPC.RESERVATION_START, id),
     complete: (id: number) => ipcRenderer.invoke(IPC.RESERVATION_COMPLETE, id),

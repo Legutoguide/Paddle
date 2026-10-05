@@ -84,7 +84,7 @@ describe('schema migration v1 -> v2 (batches / batch_id)', () => {
     assert.ok(batch);
 
     const version = db.prepare(`SELECT value FROM schema_meta WHERE key = 'version'`).get() as { value: string };
-    assert.equal(version.value, '6');
+    assert.equal(version.value, '7');
 
     // v4 migration: sponsors/campaigns must have gained their image columns too.
     const sponsorCols = db.prepare(`PRAGMA table_info(sponsors)`).all() as { name: string }[];
@@ -189,7 +189,7 @@ describe('schema migration v5 -> v6 (Prime Paddle reservation system)', () => {
     const db = openDatabase(dbPath);
 
     const version = db.prepare(`SELECT value FROM schema_meta WHERE key = 'version'`).get() as { value: string };
-    assert.equal(version.value, '6');
+    assert.equal(version.value, '7');
 
     // coupons: reservation_id column now exists, RESERVED is now a legal status.
     const couponCols = db.prepare(`PRAGMA table_info(coupons)`).all() as { name: string }[];
@@ -254,5 +254,128 @@ describe('schema migration v5 -> v6 (Prime Paddle reservation system)', () => {
     const periodsAgain = reopened.prepare(`SELECT COUNT(*) as c FROM periods`).get() as { c: number };
     assert.equal(periodsAgain.c, 4, 're-opening must not duplicate seeded period rows');
     reopened.close();
+  });
+});
+
+describe('schema migration v6 -> v7 (coupon coverage + redemption ledger)', () => {
+  test('an existing v6 database gains coverage_players (default 1) and its in-flight RESERVED/USED coupons are backfilled into coupon_redemptions', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqr-migrate-v7-'));
+    const dbPath = path.join(dir, 'legacy-v6.db');
+
+    // Build a v6-shaped database by hand: coupons already has reservation_id
+    // and the RESERVED status, but campaigns has no coverage_players yet,
+    // and coupon_redemptions/reservation_participants don't exist.
+    const legacyDb = new Database(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO schema_meta (key, value) VALUES ('version', '6');
+
+      CREATE TABLE sponsors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, notes TEXT,
+        logo_path TEXT, photo_path TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE',
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), archived_at TEXT);
+
+      CREATE TABLE campaigns (id INTEGER PRIMARY KEY AUTOINCREMENT, sponsor_id INTEGER NOT NULL,
+        campaign_name TEXT NOT NULL, service_name TEXT NOT NULL, duration TEXT,
+        discount_type TEXT NOT NULL DEFAULT 'PERCENTAGE', original_price_cents INTEGER NOT NULL,
+        discount_percentage REAL NOT NULL DEFAULT 0, discount_amount_cents INTEGER NOT NULL DEFAULT 0,
+        final_price_cents INTEGER NOT NULL, total_codes INTEGER NOT NULL DEFAULT 0, image_path TEXT,
+        banner_path TEXT, start_date TEXT, end_date TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', notes TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+        -- deliberately NO coverage_players column yet.
+
+      CREATE TABLE coupons (id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL,
+        sponsor_id INTEGER NOT NULL, code TEXT NOT NULL UNIQUE, display_seq INTEGER,
+        reservation_id INTEGER, status TEXT NOT NULL DEFAULT 'AVAILABLE'
+          CHECK (status IN ('AVAILABLE','RESERVED','USED','EXPIRED','REVOKED')),
+        expires_at TEXT, used_at TEXT, revoked_at TEXT, revoke_reason TEXT, notes TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+
+      CREATE TABLE customers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT NOT NULL,
+        notes TEXT, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+
+      CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL,
+        reservation_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+        reservation_date TEXT NOT NULL, start_time TEXT NOT NULL, duration_min INTEGER NOT NULL,
+        period_id INTEGER, players INTEGER NOT NULL DEFAULT 1, base_price_cents INTEGER NOT NULL,
+        discount_cents INTEGER NOT NULL DEFAULT 0, final_price_cents INTEGER NOT NULL,
+        coupon_id INTEGER, payment_status TEXT NOT NULL DEFAULT 'UNPAID', paid_at TEXT,
+        cancel_reason TEXT, notes TEXT, created_by_user_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+
+      CREATE TABLE usage_history (id INTEGER PRIMARY KEY AUTOINCREMENT, coupon_id INTEGER,
+        code TEXT NOT NULL, campaign_id INTEGER, sponsor_id INTEGER, sponsor_name TEXT, campaign_name TEXT,
+        original_price_cents INTEGER, discount_percentage REAL, final_price_cents INTEGER,
+        operator TEXT, used_at TEXT NOT NULL);
+
+      INSERT INTO sponsors (id, name) VALUES (1, 'Beach Co');
+      INSERT INTO campaigns (id, sponsor_id, campaign_name, service_name, original_price_cents, final_price_cents)
+        VALUES (1, 1, 'Promo', '1 Hour', 10000, 5000);
+      INSERT INTO customers (id, name, phone) VALUES (1, 'Amir', '20123456');
+      INSERT INTO reservations (id, customer_id, reservation_type, status, reservation_date, start_time,
+        duration_min, players, base_price_cents, discount_cents, final_price_cents, coupon_id)
+        VALUES (1, 1, 'ADVANCE', 'CONFIRMED', '2030-01-06', '10:00', 60, 1, 10000, 5000, 5000, 1);
+
+      -- A coupon still RESERVED (in-flight, never paid) under the OLD single-FK model.
+      INSERT INTO coupons (id, campaign_id, sponsor_id, code, reservation_id, status)
+        VALUES (1, 1, 1, 'BEACH-RSV01', 1, 'RESERVED');
+      -- A coupon already USED under the old model.
+      INSERT INTO coupons (id, campaign_id, sponsor_id, code, reservation_id, status, used_at)
+        VALUES (2, 1, 1, 'BEACH-USED01', 1, 'USED', '2030-01-01T10:00:00.000Z');
+      -- A perfectly ordinary AVAILABLE coupon, untouched either way.
+      INSERT INTO coupons (id, campaign_id, sponsor_id, code, status) VALUES (3, 1, 1, 'BEACH-FREE01', 'AVAILABLE');
+    `);
+    legacyDb.close();
+
+    const db = openDatabase(dbPath);
+
+    const version = db.prepare(`SELECT value FROM schema_meta WHERE key = 'version'`).get() as { value: string };
+    assert.equal(version.value, '7');
+
+    // campaigns.coverage_players added, defaulting to 1 for pre-existing rows.
+    const campaignCols = db.prepare(`PRAGMA table_info(campaigns)`).all() as { name: string }[];
+    assert.ok(campaignCols.some((c) => c.name === 'coverage_players'));
+    const campaign = db.prepare(`SELECT coverage_players FROM campaigns WHERE id = 1`).get() as { coverage_players: number };
+    assert.equal(campaign.coverage_players, 1);
+
+    // New tables exist.
+    for (const table of ['reservation_participants', 'coupon_redemptions']) {
+      const row = db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get() as { c: number };
+      assert.ok(row.c >= 0, `${table} must exist and be queryable`);
+    }
+
+    // The RESERVED coupon's old reservation_id link is backfilled into a
+    // RESERVED ledger row — nothing about its in-flight reservation is lost.
+    const reservedLedger = db
+      .prepare(`SELECT * FROM coupon_redemptions WHERE coupon_id = 1`)
+      .get() as { reservation_id: number; status: string; coverage_consumed: number; eligible_amount_cents: number; discount_cents: number } | undefined;
+    assert.ok(reservedLedger, 'the in-flight RESERVED coupon must get a backfilled ledger row');
+    assert.equal(reservedLedger!.reservation_id, 1);
+    assert.equal(reservedLedger!.status, 'RESERVED');
+    assert.equal(reservedLedger!.coverage_consumed, 1);
+    assert.equal(reservedLedger!.eligible_amount_cents, 10000); // reservation's own base_price_cents
+    assert.equal(reservedLedger!.discount_cents, 5000); // reservation's own discount_cents
+
+    // The already-USED coupon is backfilled as CONSUMED, not RESERVED.
+    const usedLedger = db
+      .prepare(`SELECT status FROM coupon_redemptions WHERE coupon_id = 2`)
+      .get() as { status: string } | undefined;
+    assert.ok(usedLedger);
+    assert.equal(usedLedger!.status, 'CONSUMED');
+
+    // The plain AVAILABLE coupon gets no ledger row at all.
+    const freeLedger = db.prepare(`SELECT COUNT(*) as c FROM coupon_redemptions WHERE coupon_id = 3`).get() as { c: number };
+    assert.equal(freeLedger.c, 0);
+
+    // Re-opening an already-migrated (v7) database must not duplicate the backfill.
+    db.close();
+    const reopened = openDatabase(dbPath);
+    const countAgain = (reopened.prepare(`SELECT COUNT(*) as c FROM coupon_redemptions`).get() as { c: number }).c;
+    reopened.close();
+    assert.equal(countAgain, 2, 're-opening must not duplicate backfilled ledger rows');
   });
 });

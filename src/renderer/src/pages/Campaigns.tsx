@@ -98,6 +98,7 @@ export default function Campaigns() {
                 <th className="px-4 py-3 font-medium">Original</th>
                 <th className="px-4 py-3 font-medium">Discount</th>
                 <th className="px-4 py-3 font-medium">Final</th>
+                <th className="px-4 py-3 font-medium">Coverage</th>
                 <th className="px-4 py-3 font-medium">Codes</th>
                 <th className="px-4 py-3 font-medium">Status</th>
                 <th className="px-4 py-3 font-medium text-right">Actions</th>
@@ -115,6 +116,7 @@ export default function Campaigns() {
                   <td className="px-4 py-3 text-gray-500 line-through">{formatMoney(c.originalPriceCents)}</td>
                   <td className="px-4 py-3 text-accent">{c.discountPercentage}%</td>
                   <td className="px-4 py-3 text-gray-100 font-medium">{formatMoney(c.finalPriceCents)}</td>
+                  <td className="px-4 py-3 text-gray-400">{c.coveragePlayers} player{c.coveragePlayers > 1 ? 's' : ''}</td>
                   <td className="px-4 py-3 text-gray-400">{c.totalCodes}</td>
                   <td className="px-4 py-3">
                     <StatusBadge status={c.status} />
@@ -171,6 +173,11 @@ function CreateCampaignWizard({
   const [duration, setDuration] = useState('');
   const [originalPrice, setOriginalPrice] = useState<string>('');
   const [discountPercentage, setDiscountPercentage] = useState<string>('');
+  // Coverage: how many players a coupon from this campaign can discount.
+  // Defaults to 1 player — the common case.
+  const [coveragePreset, setCoveragePreset] = useState<'1' | '2' | '3' | '4' | 'custom'>('1');
+  const [coverageCustom, setCoverageCustom] = useState<string>('5');
+  const coveragePlayers = coveragePreset === 'custom' ? Math.max(1, Number(coverageCustom) || 1) : Number(coveragePreset);
   const [numberOfCodes, setNumberOfCodes] = useState<string>('10');
   const [prefix, setPrefix] = useState('');
   const [imagePath, setImagePath] = useState<string | null>(null);
@@ -236,6 +243,7 @@ function CreateCampaignWizard({
         bannerPath,
         startDate: startDate || null,
         endDate: endDate || null,
+        coveragePlayers,
       });
 
       const count = Number(numberOfCodes);
@@ -345,6 +353,42 @@ function CreateCampaignWizard({
         <div>
           <label className="label">Discount %</label>
           <input className="input" type="number" min="0" max="100" value={discountPercentage} onChange={(e) => setDiscountPercentage(e.target.value)} placeholder="50" />
+        </div>
+
+        <div className="col-span-2">
+          <label className="label">Coupon Coverage — how many players can this coupon discount?</label>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(['1', '2', '3', '4'] as const).map((n) => (
+              <button
+                key={n}
+                type="button"
+                onClick={() => setCoveragePreset(n)}
+                className={`badge border ${coveragePreset === n ? 'border-accent bg-accent/20 text-white' : 'border-base-border text-gray-400'}`}
+              >
+                {n} Player{n === '1' ? '' : 's'}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => setCoveragePreset('custom')}
+              className={`badge border ${coveragePreset === 'custom' ? 'border-accent bg-accent/20 text-white' : 'border-base-border text-gray-400'}`}
+            >
+              Custom
+            </button>
+            {coveragePreset === 'custom' && (
+              <input
+                className="input !w-20 !py-1"
+                type="number"
+                min={1}
+                value={coverageCustom}
+                onChange={(e) => setCoverageCustom(e.target.value)}
+              />
+            )}
+          </div>
+          <p className="mt-1 text-[11px] text-gray-500">
+            A coupon's discount applies only to the players it covers — e.g. a 1-player coupon on a 4-player
+            booking discounts just that 1 player's share, never the whole booking.
+          </p>
         </div>
 
         {breakdown && (

@@ -14,10 +14,12 @@ import { todayStr, addDays, nowHHMM, prettyDate } from '@/lib/dates';
 type Mode = 'walkin' | 'advance';
 
 interface CouponPreview {
+  couponId: number;
   code: string;
   sponsorName: string;
   campaignName: string;
-  originalPriceCents: number;
+  coveragePlayers: number;
+  remainingCoverage: number;
   discountType: 'PERCENTAGE' | 'FIXED';
   discountPercentage: number;
   discountAmountCents: number;
@@ -147,11 +149,14 @@ export default function NewReservation() {
       const res = await window.api.coupons.validate(code);
       if (res.outcome === 'VALID') {
         const c = res.coupon;
+        const state = await window.api.coupons.coverageState(c.id);
         setCoupon({
+          couponId: c.id,
           code: c.code,
           sponsorName: c.sponsorName,
           campaignName: c.campaignName,
-          originalPriceCents: c.originalPriceCents,
+          coveragePlayers: c.coveragePlayers,
+          remainingCoverage: state.remainingCoverage,
           discountType: c.discountType,
           discountPercentage: c.discountPercentage,
           discountAmountCents: c.discountAmountCents,
@@ -167,22 +172,27 @@ export default function NewReservation() {
     }
   };
 
-  // A coupon's own campaign price REPLACES the per-player total — it does
-  // not stack on top of it (a coupon often already represents a specific
-  // group package the business configured, e.g. a "2 players" deal).
+  // A coupon's discount applies only to the slice of the booking it
+  // COVERS (price/player x coverage) — never the whole subtotal unless its
+  // coverage happens to equal the full player count. coverageUsable is
+  // capped by both the coupon's own remaining coverage and this booking's
+  // player count, exactly like the server does — this is a preview only,
+  // the server always recomputes authoritatively on creation.
+  const coverageUsable = coupon ? Math.min(coupon.coveragePlayers, coupon.remainingCoverage, players) : 0;
   const breakdown = useMemo(() => {
-    if (coupon) {
+    if (basePrice === null || perPlayerRate === null) return null;
+    if (coupon && coverageUsable > 0) {
+      const eligible = perPlayerRate * coverageUsable;
       const b = calculatePrice({
-        originalPriceCents: coupon.originalPriceCents,
+        originalPriceCents: eligible,
         discountType: coupon.discountType,
         discountPercentage: coupon.discountPercentage,
         discountAmountCents: coupon.discountAmountCents,
       });
-      return { base: coupon.originalPriceCents, discount: b.youSaveCents, final: b.finalPriceCents };
+      return { base: basePrice, discount: b.youSaveCents, final: basePrice - b.youSaveCents, eligible };
     }
-    if (basePrice === null) return null;
-    return { base: basePrice, discount: 0, final: basePrice };
-  }, [basePrice, coupon]);
+    return { base: basePrice, discount: 0, final: basePrice, eligible: 0 };
+  }, [basePrice, perPlayerRate, coupon, coverageUsable]);
 
 
   // Which slots can this party actually book right now?
@@ -430,10 +440,13 @@ export default function NewReservation() {
               </button>
             </div>
             {coupon && (
-              <p className="text-sm text-success">
-                ✓ {coupon.sponsorName} · {coupon.campaignName} —{' '}
-                {coupon.discountType === 'PERCENTAGE' ? `${coupon.discountPercentage}% off` : `${formatMoney(coupon.discountAmountCents)} off`}. It will be locked to this booking and used automatically when it is paid.
-                {' '}This coupon's own price ({formatMoney(coupon.originalPriceCents)}) is used instead of the per-player rate.
+              <p className={`text-sm ${coverageUsable > 0 ? 'text-success' : 'text-warning'}`}>
+                ✓ {coupon.sponsorName} · {coupon.campaignName} — covers {coupon.coveragePlayers} player
+                {coupon.coveragePlayers > 1 ? 's' : ''} · {coupon.remainingCoverage} remaining ·{' '}
+                {coupon.discountType === 'PERCENTAGE' ? `${coupon.discountPercentage}% off` : `${formatMoney(coupon.discountAmountCents)} off`}
+                {coverageUsable > 0
+                  ? ` the covered ${coverageUsable} player${coverageUsable > 1 ? 's' : ''}' share. Locked to this booking and used automatically when paid.`
+                  : ' — no coverage remains on this coupon right now.'}
               </p>
             )}
             {couponError && <p className="text-sm text-danger">{couponError}</p>}
@@ -455,15 +468,14 @@ export default function NewReservation() {
               <p className="text-danger">{priceError} Ask an admin to add a pricing rule in Booking Setup.</p>
             ) : breakdown ? (
               <>
-                {coupon ? (
-                  <Line k="Coupon package price" v={formatMoney(breakdown.base)} />
-                ) : (
-                  <>
-                    <Line k="Price" v={formatMoney(breakdown.base)} />
-                    {perPlayerRate !== null && players > 1 && (
-                      <p className="text-right text-[11px] text-gray-500">{formatMoney(perPlayerRate)} × {players} players</p>
-                    )}
-                  </>
+                <Line k="Subtotal" v={formatMoney(breakdown.base)} />
+                {perPlayerRate !== null && players > 1 && (
+                  <p className="text-right text-[11px] text-gray-500">{formatMoney(perPlayerRate)} × {players} players</p>
+                )}
+                {coupon && coverageUsable > 0 && (
+                  <div className="flex justify-between text-[11px] text-gray-500">
+                    <span>{coupon.code} covers {coverageUsable} player{coverageUsable > 1 ? 's' : ''} ({formatMoney(breakdown.eligible)})</span>
+                  </div>
                 )}
                 {breakdown.discount > 0 && <Line k="Coupon discount" v={`− ${formatMoney(breakdown.discount)}`} />}
                 <Line k="Total" v={formatMoney(breakdown.final)} strong />

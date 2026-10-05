@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 /**
  * Open (and initialize if needed) the SQLite database at the given path.
@@ -193,6 +193,62 @@ function runMigrations(db: Database.Database): void {
         insertPeriod.run('Evening', '18:30', '21:00', 3);
       });
       seedPeriods();
+    }
+  }
+
+  if (currentVersion < 7) {
+    // v7: coupon coverage (N players per coupon) + partial/multi-reservation
+    // redemption ledger + optional reservation participants.
+    //
+    // campaigns.coverage_players: brand-new column, simple ADD COLUMN (no
+    // CHECK constraint needed here — the app layer validates it, same
+    // pattern as other ADD COLUMN migrations in this file).
+    const campaignColumns = db.prepare(`PRAGMA table_info(campaigns)`).all() as { name: string }[];
+    if (!campaignColumns.some((c) => c.name === 'coverage_players')) {
+      db.exec(`ALTER TABLE campaigns ADD COLUMN coverage_players INTEGER NOT NULL DEFAULT 1`);
+    }
+
+    // reservation_participants / coupon_redemptions are brand-new tables,
+    // already created above by schema.sql's CREATE TABLE IF NOT EXISTS.
+    //
+    // Backfill: any coupon already AVAILABLE/RESERVED/USED and still
+    // carrying a v6-style reservation_id must get a matching ledger row,
+    // so nothing already in flight is silently lost when the old single-FK
+    // field stops being read by the app. coverage_consumed = 1 (coverage
+    // was always implicitly 1 before this migration — campaigns.coverage_players
+    // just defaulted to 1 above for every pre-existing campaign).
+    const toBackfill = db
+      .prepare(
+        `SELECT c.id as id, c.reservation_id as reservation_id, c.status as status,
+                r.base_price_cents as base_price_cents, r.discount_cents as discount_cents
+         FROM coupons c
+         JOIN reservations r ON r.id = c.reservation_id
+         WHERE c.reservation_id IS NOT NULL
+           AND c.status IN ('RESERVED','USED')
+           AND NOT EXISTS (SELECT 1 FROM coupon_redemptions cr WHERE cr.coupon_id = c.id AND cr.reservation_id = c.reservation_id)`
+      )
+      .all() as { id: number; reservation_id: number; status: string; base_price_cents: number; discount_cents: number }[];
+
+    if (toBackfill.length > 0) {
+      const insertRedemption = db.prepare(
+        `INSERT INTO coupon_redemptions
+           (coupon_id, reservation_id, coverage_consumed, eligible_amount_cents, discount_cents, status, consumed_at)
+         VALUES (?, ?, 1, ?, ?, ?, ?)`
+      );
+      const backfill = db.transaction(() => {
+        for (const row of toBackfill) {
+          const status = row.status === 'USED' ? 'CONSUMED' : 'RESERVED';
+          insertRedemption.run(
+            row.id,
+            row.reservation_id,
+            row.base_price_cents,
+            row.discount_cents,
+            status,
+            status === 'CONSUMED' ? new Date().toISOString() : null
+          );
+        }
+      });
+      backfill();
     }
   }
 

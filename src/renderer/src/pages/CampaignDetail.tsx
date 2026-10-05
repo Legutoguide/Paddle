@@ -90,10 +90,11 @@ export default function CampaignDetail() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-7">
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-8">
         <StatBox label="Original Price" value={formatMoney(campaign.originalPriceCents)} muted />
         <StatBox label="Discount" value={`${campaign.discountPercentage}%`} accent />
         <StatBox label="Final Price" value={formatMoney(campaign.finalPriceCents)} accent />
+        <StatBox label="Coverage" value={`${campaign.coveragePlayers} player${campaign.coveragePlayers > 1 ? 's' : ''}`} />
         <StatBox label="Total Codes" value={String(stats.totalCodes)} />
         <StatBox label="Available" value={String(stats.available)} tone="success" />
         <StatBox label="Used" value={String(stats.used)} tone="teal" />

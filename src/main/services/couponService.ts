@@ -1,6 +1,15 @@
 import type Database from 'better-sqlite3';
 import { mapCoupon, mapCouponWithDetails, type CouponRow, type CouponWithDetailsRow } from '../db/mappers';
-import type { Coupon, CouponWithDetails, ValidationResult, CouponStatus, ReservationStatus } from '../../shared/types/domain';
+import type {
+  Coupon,
+  CouponWithDetails,
+  ValidationResult,
+  CouponStatus,
+  ReservationStatus,
+  CouponCoverageState,
+  RedemptionStatus,
+} from '../../shared/types/domain';
+import { calculatePrice } from '../../shared/lib/pricing';
 import { generateUniqueCodes } from '../../shared/lib/codeGenerator';
 import { AuditService } from './auditService';
 import { CampaignService, CampaignNotFoundError } from './campaignService';
@@ -29,7 +38,8 @@ const DETAILS_JOIN = `
          cm.discount_amount_cents as discount_amount_cents,
          cm.discount_type as discount_type,
          cm.final_price_cents as final_price_cents,
-         cm.status as campaign_status
+         cm.status as campaign_status,
+         cm.coverage_players as coverage_players
   FROM coupons c
   JOIN sponsors s ON s.id = c.sponsor_id
   JOIN campaigns cm ON cm.id = c.campaign_id
@@ -290,18 +300,13 @@ export class CouponService {
         return { outcome: 'EXPIRED', coupon };
       case 'RESERVED': {
         // Validation-only: scanning a RESERVED coupon must NEVER consume it
-        // or change its status. Staff sees which reservation holds it so
-        // they understand why it can't be used for a different transaction.
-        const reservation = coupon.reservationId
-          ? (this.db
-              .prepare<[number], { id: number; reservation_date: string; start_time: string; status: string; customer_name: string }>(
-                `SELECT r.id, r.reservation_date, r.start_time, r.status, c.name as customer_name
-                 FROM reservations r JOIN customers c ON c.id = r.customer_id
-                 WHERE r.id = ?`
-              )
-              .get(coupon.reservationId))
-          : null;
-        if (!reservation) {
+        // or change its status. Staff sees which reservation(s) currently
+        // hold its coverage — coverage can be split across more than one
+        // booking (e.g. a 2-player coupon, 1 unit held by each of two
+        // different reservations) so this is always a list, not a single one.
+        const state = this.coverageState(coupon.id);
+        const reserved = state.activeRedemptions.filter((r) => r.status === 'RESERVED');
+        if (reserved.length === 0) {
           // Data inconsistency (should never happen given the transactional
           // guarantees in ReservationService) — fail safe as INVALID rather
           // than crash or silently treat it as usable.
@@ -310,13 +315,13 @@ export class CouponService {
         return {
           outcome: 'RESERVED',
           coupon,
-          reservation: {
-            id: reservation.id,
-            reservationDate: reservation.reservation_date,
-            startTime: reservation.start_time,
-            customerName: reservation.customer_name,
-            status: reservation.status as ReservationStatus,
-          },
+          reservations: reserved.map((r) => ({
+            id: r.reservationId,
+            reservationDate: r.reservationDate,
+            startTime: r.startTime,
+            customerName: r.customerName,
+            status: r.reservationStatus,
+          })),
         };
       }
       case 'AVAILABLE':
@@ -366,11 +371,15 @@ export class CouponService {
 
       const usedAt = new Date().toISOString();
       const wasReservedOverride = effective === 'RESERVED' && options?.allowReservedOverride === true;
-      const previousReservationId = coupon.reservationId;
+      // Every reservation currently holding a slice of this coupon's
+      // coverage, captured BEFORE we release them, purely for the audit log.
+      const releasedFromReservationIds = wasReservedOverride
+        ? this.coverageState(coupon.id).activeRedemptions.filter((r) => r.status === 'RESERVED').map((r) => r.reservationId)
+        : [];
 
       const updateResult = this.db
         .prepare(
-          `UPDATE coupons SET status = 'USED', used_at = ?, reservation_id = NULL, updated_at = ?
+          `UPDATE coupons SET status = 'USED', used_at = ?, updated_at = ?
            WHERE id = ? AND status IN ('AVAILABLE', 'RESERVED')`
         )
         .run(usedAt, usedAt, coupon.id);
@@ -380,12 +389,22 @@ export class CouponService {
         throw new CouponConflictError('This coupon has already been used');
       }
 
-      // If this coupon was still linked to a reservation, detach that link
-      // too — an overridden coupon is no longer "held" by that booking.
-      if (wasReservedOverride && previousReservationId) {
-        this.db
-          .prepare(`UPDATE reservations SET coupon_id = NULL, updated_at = ? WHERE id = ? AND coupon_id = ?`)
-          .run(usedAt, previousReservationId, coupon.id);
+      // An overridden coupon is force-taken for this direct register use —
+      // any reservation(s) still holding a RESERVED slice of it lose that
+      // claim (same RELEASED transition as a cancellation). Their cached
+      // discount/total will look stale until that reservation's coupon is
+      // detached/re-attached or the booking is otherwise revisited — this
+      // is an intentional, rare, CEO-only exception path, not the normal
+      // flow, so it is not silently auto-repaired here.
+      if (wasReservedOverride) {
+        for (const reservationId of releasedFromReservationIds) {
+          this.db
+            .prepare(
+              `UPDATE coupon_redemptions SET status = 'RELEASED', released_at = ?
+               WHERE coupon_id = ? AND reservation_id = ? AND status = 'RESERVED'`
+            )
+            .run(usedAt, coupon.id, reservationId);
+        }
       }
 
       this.db
@@ -413,7 +432,7 @@ export class CouponService {
         this.audit.log('COUPON_RESERVED_OVERRIDE', 'coupon', coupon.id, {
           code: coupon.code,
           operator: operator ?? null,
-          releasedFromReservationId: previousReservationId,
+          releasedFromReservationIds,
         });
       } else {
         this.audit.log('COUPON_USED', 'coupon', coupon.id, { code: coupon.code, operator: operator ?? null });
@@ -427,7 +446,7 @@ export class CouponService {
         entityId: coupon.id,
       });
 
-      return { coupon: { ...coupon, status: 'USED' as const, usedAt, reservationId: null }, usedAt };
+      return { coupon: { ...coupon, status: 'USED' as const, usedAt }, usedAt };
     });
 
     return runConsume();
@@ -446,92 +465,251 @@ export class CouponService {
   // corrupting state, exactly like confirmUse() above.
   // --------------------------------------------------------------------
 
-  /**
-   * AVAILABLE -> RESERVED, locking the coupon to one reservation.
-   *
-   * `playDate` ('YYYY-MM-DD') is the day the customer will actually use the
-   * coupon. A coupon must still be valid on that day, so one that expires
-   * before the booking date is refused up front instead of failing later at
-   * the till. (The background expiry sweeper only flips AVAILABLE coupons,
-   * so an overdue-but-unswept coupon is also caught here.)
-   */
-  reserveForReservation(couponId: number, reservationId: number, playDate?: string): void {
-    const existing = this.getById(couponId);
-    if (!existing) throw new CouponNotFoundError('Coupon not found');
-    if (existing.status === 'RESERVED') {
-      throw new CouponConflictError(
-        'Coupon Reserved: this coupon is already reserved and cannot be used for another reservation.'
-      );
+  // --------------------------------------------------------------------
+  // Reservation integration (Prime Paddle, schema v7 — coverage ledger)
+  //
+  // A coupon's coverage (campaign.coverage_players) is how many players its
+  // discount can apply to — NOT a flat replacement price. These methods are
+  // deliberately NOT self-wrapped in their own db.transaction() — they are
+  // building blocks meant to be called from *inside* ReservationService's
+  // own transaction, alongside the matching reservations-table update, so
+  // that e.g. "payment PAID" and "coverage CONSUMED" either both happen or
+  // neither does.
+  //
+  // coupons.status/used_at are kept as a maintained CACHE recomputed after
+  // every ledger change (recomputeCachedStatus below) — the actual source
+  // of truth is always coupon_redemptions + campaign.coverage_players,
+  // queried live via coverageState(). This keeps existing status-based
+  // reads (lists, Scan & Validate) working unchanged for the common
+  // coverage=1 case, while supporting partial/multi-reservation coverage
+  // underneath for coverage>1.
+  // --------------------------------------------------------------------
+
+  /** Live-computed remaining coverage for a coupon — never stored. */
+  coverageState(couponId: number): CouponCoverageState {
+    const coupon = this.getDetailsById(couponId);
+    if (!coupon) throw new CouponNotFoundError('Coupon not found');
+
+    const rows = this.db
+      .prepare<[number], { coverage_consumed: number; status: string }>(
+        `SELECT coverage_consumed, status FROM coupon_redemptions WHERE coupon_id = ? AND status IN ('RESERVED','CONSUMED')`
+      )
+      .all(couponId);
+    const consumedCoverage = rows.reduce(
+      (sum: number, r: { coverage_consumed: number; status: string }) => sum + r.coverage_consumed,
+      0
+    );
+    const remainingCoverage = Math.max(0, coupon.coveragePlayers - consumedCoverage);
+
+    const active = this.db
+      .prepare<[number], {
+        reservation_id: number;
+        coverage_consumed: number;
+        status: string;
+        reservation_date: string;
+        start_time: string;
+        customer_name: string;
+        reservation_status: string;
+      }>(
+        `SELECT cr.reservation_id as reservation_id, cr.coverage_consumed as coverage_consumed, cr.status as status,
+                r.reservation_date as reservation_date, r.start_time as start_time, c.name as customer_name,
+                r.status as reservation_status
+         FROM coupon_redemptions cr
+         JOIN reservations r ON r.id = cr.reservation_id
+         JOIN customers c ON c.id = r.customer_id
+         WHERE cr.coupon_id = ? AND cr.status IN ('RESERVED','CONSUMED')
+         ORDER BY cr.created_at`
+      )
+      .all(couponId);
+
+    return {
+      couponId,
+      coveragePlayers: coupon.coveragePlayers,
+      consumedCoverage,
+      remainingCoverage,
+      activeRedemptions: active.map(
+        (r: {
+          reservation_id: number;
+          coverage_consumed: number;
+          status: string;
+          reservation_date: string;
+          start_time: string;
+          customer_name: string;
+          reservation_status: string;
+        }) => ({
+          reservationId: r.reservation_id,
+          coverageConsumed: r.coverage_consumed,
+          status: r.status as RedemptionStatus,
+          reservationDate: r.reservation_date,
+          startTime: r.start_time,
+          customerName: r.customer_name,
+          reservationStatus: r.reservation_status as ReservationStatus,
+        })
+      ),
+    };
+  }
+
+  /** Recomputes and persists the coupons.status CACHE from the ledger —
+   * called after every reserve/release/consume so list/filter queries and
+   * the legacy single-coupon-status reads (Scan & Validate, Coupons page)
+   * stay correct without needing a live aggregate on every read. */
+  private recomputeCachedStatus(couponId: number): void {
+    const coupon = this.getById(couponId);
+    if (!coupon || coupon.status === 'REVOKED' || coupon.status === 'EXPIRED') return; // explicit states win
+    const state = this.coverageState(couponId);
+    const now = new Date().toISOString();
+    if (state.remainingCoverage > 0) {
+      this.db.prepare(`UPDATE coupons SET status = 'AVAILABLE', updated_at = ? WHERE id = ?`).run(now, couponId);
+      return;
     }
-    if (existing.status === 'USED') throw new CouponConflictError('This coupon has already been used');
-    if (existing.status === 'REVOKED') throw new CouponConflictError('This coupon has been revoked');
-    if (existing.status === 'EXPIRED') throw new CouponConflictError('This coupon has expired');
-    if (existing.expiresAt) {
+    const hasReserved = state.activeRedemptions.some((r) => r.status === 'RESERVED');
+    if (hasReserved) {
+      this.db.prepare(`UPDATE coupons SET status = 'RESERVED', updated_at = ? WHERE id = ?`).run(now, couponId);
+    } else {
+      this.db
+        .prepare(`UPDATE coupons SET status = 'USED', used_at = COALESCE(used_at, ?), updated_at = ? WHERE id = ?`)
+        .run(now, now, couponId);
+    }
+  }
+
+  /**
+   * Reserve up to `requestedCoverage` units of a coupon's coverage for one
+   * reservation (optionally for one named participant). Grants
+   * `min(requestedCoverage, remainingCoverage)` — never more than what's
+   * actually left, and THIS capping is what makes partial usage happen
+   * naturally (e.g. a 2-player coupon with 1 unit already used elsewhere
+   * grants only 1 here, not 2). Throws if nothing at all is left, if the
+   * coupon is REVOKED/EXPIRED, or if it expires before `playDate`.
+   *
+   * `pricePerPlayerCents` is the reservation's own per-player rate — the
+   * eligible amount discounted is `pricePerPlayerCents x coverageGranted`,
+   * never the campaign's own listed price and never the reservation's full
+   * total unless the coverage happens to equal the full player count.
+   */
+  reserveCoverage(params: {
+    couponId: number;
+    reservationId: number;
+    participantId?: number | null;
+    requestedCoverage: number;
+    pricePerPlayerCents: number;
+    playDate?: string;
+    actorUserId?: number | null;
+  }): { redemptionId: number; coverageGranted: number; eligibleAmountCents: number; discountCents: number } {
+    const coupon = this.getDetailsById(params.couponId);
+    if (!coupon) throw new CouponNotFoundError('Coupon not found');
+    if (coupon.status === 'REVOKED') throw new CouponConflictError('This coupon has been revoked');
+    if (coupon.status === 'EXPIRED') throw new CouponConflictError('This coupon has expired');
+    if (coupon.expiresAt) {
       const nowIso = new Date().toISOString();
-      if (existing.expiresAt < nowIso) throw new CouponConflictError('This coupon has expired');
-      if (playDate && existing.expiresAt.slice(0, 10) < playDate) {
+      if (coupon.expiresAt < nowIso) throw new CouponConflictError('This coupon has expired');
+      if (params.playDate && coupon.expiresAt.slice(0, 10) < params.playDate) {
         throw new CouponConflictError(
-          `This coupon expires on ${existing.expiresAt.slice(0, 10)}, before the reservation date (${playDate}).`
+          `This coupon expires on ${coupon.expiresAt.slice(0, 10)}, before the reservation date (${params.playDate}).`
         );
       }
     }
 
-    const now = new Date().toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE coupons SET status = 'RESERVED', reservation_id = ?, updated_at = ?
-         WHERE id = ? AND status = 'AVAILABLE'`
+    const existing = this.db
+      .prepare<[number, number], { id: number }>(
+        `SELECT id FROM coupon_redemptions WHERE coupon_id = ? AND reservation_id = ? AND status IN ('RESERVED','CONSUMED')`
       )
-      .run(reservationId, now, couponId);
-    if (result.changes === 0) {
-      // Lost a race between the checks above and this write.
+      .get(params.couponId, params.reservationId);
+    if (existing) {
+      throw new CouponConflictError('This coupon is already attached to this reservation.');
+    }
+
+    const state = this.coverageState(params.couponId);
+    const coverageGranted = Math.min(params.requestedCoverage, state.remainingCoverage);
+    if (coverageGranted <= 0) {
       throw new CouponConflictError(
-        'Coupon Reserved: this coupon is already reserved and cannot be used for another reservation.'
+        'Coupon Reserved: this coupon has no remaining coverage left and cannot be used for another reservation.'
       );
     }
-    this.audit.log('COUPON_RESERVED', 'coupon', couponId, { reservationId });
+
+    const eligibleAmountCents = params.pricePerPlayerCents * coverageGranted;
+    const breakdown = calculatePrice({
+      originalPriceCents: eligibleAmountCents,
+      discountType: coupon.discountType,
+      discountPercentage: coupon.discountPercentage,
+      discountAmountCents: coupon.discountAmountCents,
+    });
+    const discountCents = breakdown.youSaveCents;
+
+    const result = this.db
+      .prepare(
+        `INSERT INTO coupon_redemptions
+          (coupon_id, reservation_id, participant_id, coverage_consumed, eligible_amount_cents, discount_cents, status, actor_user_id)
+         VALUES (?, ?, ?, ?, ?, ?, 'RESERVED', ?)`
+      )
+      .run(
+        params.couponId,
+        params.reservationId,
+        params.participantId ?? null,
+        coverageGranted,
+        eligibleAmountCents,
+        discountCents,
+        params.actorUserId ?? null
+      );
+
+    this.recomputeCachedStatus(params.couponId);
+    this.audit.log('COUPON_COVERAGE_RESERVED', 'coupon', params.couponId, {
+      reservationId: params.reservationId,
+      participantId: params.participantId ?? null,
+      coverageGranted,
+      eligibleAmountCents,
+      discountCents,
+    });
+
+    return { redemptionId: Number(result.lastInsertRowid), coverageGranted, eligibleAmountCents, discountCents };
   }
 
   /**
-   * RESERVED -> AVAILABLE, releasing a coupon back to the pool. Used on
-   * cancellation/no-show. Intentionally a no-op (not a thrown error) if the
-   * coupon is no longer RESERVED-by-this-reservation — e.g. it was already
-   * consumed via markAsPaid or a CEO override — since "the reservation is
-   * being cancelled" doesn't retroactively undo a completed payment.
+   * Release a RESERVED (not yet paid) redemption back to the pool — used on
+   * cancellation/no-show. A no-op (not a thrown error) if there is no
+   * active RESERVED row for this (coupon, reservation) pair — e.g. it was
+   * already CONSUMED via payment, which cancelling must never undo.
    */
-  releaseReservation(couponId: number, reservationId: number): { released: boolean } {
+  releaseCoverage(couponId: number, reservationId: number): { released: boolean; coverageReleased: number } {
     const now = new Date().toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE coupons SET status = 'AVAILABLE', reservation_id = NULL, updated_at = ?
-         WHERE id = ? AND status = 'RESERVED' AND reservation_id = ?`
+    const row = this.db
+      .prepare<[number, number], { id: number; coverage_consumed: number }>(
+        `SELECT id, coverage_consumed FROM coupon_redemptions WHERE coupon_id = ? AND reservation_id = ? AND status = 'RESERVED'`
       )
-      .run(now, couponId, reservationId);
-    if (result.changes > 0) {
-      this.audit.log('COUPON_RELEASED', 'coupon', couponId, { reservationId });
-    }
-    return { released: result.changes > 0 };
+      .get(couponId, reservationId);
+    if (!row) return { released: false, coverageReleased: 0 };
+
+    this.db.prepare(`UPDATE coupon_redemptions SET status = 'RELEASED', released_at = ? WHERE id = ?`).run(now, row.id);
+    this.recomputeCachedStatus(couponId);
+    this.audit.log('COUPON_COVERAGE_RELEASED', 'coupon', couponId, { reservationId, coverageReleased: row.coverage_consumed });
+    return { released: true, coverageReleased: row.coverage_consumed };
   }
 
   /**
-   * RESERVED -> USED, as part of a reservation's payment completing. Throws
-   * if the coupon isn't currently RESERVED-by-this-reservation, so the
-   * caller's outer transaction rolls back rather than leaving payment PAID
-   * with the coupon untouched.
+   * RESERVED -> CONSUMED for one (coupon, reservation) redemption, as part
+   * of that reservation's payment completing. Throws if there is no active
+   * RESERVED row, so the caller's outer transaction (markAsPaid) rolls back
+   * rather than leaving payment PAID with coverage untouched.
    */
-  consumeForReservation(couponId: number, reservationId: number): { usedAt: string } {
-    const usedAt = new Date().toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE coupons SET status = 'USED', used_at = ?, updated_at = ?
-         WHERE id = ? AND status = 'RESERVED' AND reservation_id = ?`
+  consumeCoverage(
+    couponId: number,
+    reservationId: number
+  ): { consumedAt: string; coverageConsumed: number; discountCents: number } {
+    const consumedAt = new Date().toISOString();
+    const row = this.db
+      .prepare<[number, number], { id: number; coverage_consumed: number; eligible_amount_cents: number; discount_cents: number }>(
+        `SELECT id, coverage_consumed, eligible_amount_cents, discount_cents FROM coupon_redemptions
+         WHERE coupon_id = ? AND reservation_id = ? AND status = 'RESERVED'`
       )
-      .run(usedAt, usedAt, couponId, reservationId);
-    if (result.changes === 0) {
+      .get(couponId, reservationId);
+    if (!row) {
       throw new CouponConflictError(
         'This coupon is no longer reserved for this reservation and cannot be marked used.'
       );
     }
+
+    this.db.prepare(`UPDATE coupon_redemptions SET status = 'CONSUMED', consumed_at = ? WHERE id = ?`).run(consumedAt, row.id);
+    this.recomputeCachedStatus(couponId);
+
     const coupon = this.getById(couponId)!;
     this.db
       .prepare(
@@ -539,43 +717,71 @@ export class CouponService {
           (coupon_id, code, campaign_id, sponsor_id, sponsor_name, campaign_name,
            original_price_cents, discount_percentage, final_price_cents, operator, used_at)
          SELECT c.id, c.code, c.campaign_id, c.sponsor_id, s.name, cm.campaign_name,
-                cm.original_price_cents, cm.discount_percentage, cm.final_price_cents, ?, ?
+                ?, cm.discount_percentage, ? - ?, ?, ?
          FROM coupons c JOIN sponsors s ON s.id = c.sponsor_id JOIN campaigns cm ON cm.id = c.campaign_id
          WHERE c.id = ?`
       )
-      .run(`reservation:${reservationId}`, usedAt, couponId);
-    this.audit.log('COUPON_USED', 'coupon', couponId, { reservationId, via: 'reservation_payment' });
+      .run(
+        row.eligible_amount_cents,
+        row.eligible_amount_cents,
+        row.discount_cents,
+        `reservation:${reservationId}`,
+        consumedAt,
+        couponId
+      );
+    this.audit.log('COUPON_COVERAGE_CONSUMED', 'coupon', couponId, {
+      reservationId,
+      coverageConsumed: row.coverage_consumed,
+      discountCents: row.discount_cents,
+    });
     this.notifications.emit({
       type: 'QR_REDEEMED',
       title: 'QR code redeemed',
-      message: `${coupon.code} used automatically on reservation #${reservationId} payment.`,
+      message: `${coupon.code} used automatically on reservation #${reservationId} payment (${row.coverage_consumed} player(s)).`,
       entity: 'coupon',
       entityId: couponId,
     });
-    return { usedAt };
+    return { consumedAt, coverageConsumed: row.coverage_consumed, discountCents: row.discount_cents };
   }
 
   /**
-   * Move a RESERVED coupon from one reservation to another without ever
-   * passing through AVAILABLE — used only by ReservationService's
-   * Walk-in -> Advance reschedule flow, where the customer keeps the same
-   * coupon but the booking itself is cancelled-and-recreated for a new
-   * date/time. Throws if the coupon isn't currently reserved by
-   * `fromReservationId`, so a stale/racing caller can't hijack someone
-   * else's coupon mid-transfer.
+   * Move a RESERVED redemption from one reservation to another without
+   * ever passing through AVAILABLE — used only by ReservationService's
+   * Walk-in -> Advance reschedule flow. The coverage amount itself never
+   * changes, but `newPricePerPlayerCents` lets the eligible/discount amount
+   * be recomputed for the new date's rate (a reschedule can move a booking
+   * to a day/period with a different per-player price). Throws if there is
+   * no active RESERVED row for `fromReservationId`.
    */
-  transferReservation(couponId: number, fromReservationId: number, toReservationId: number): void {
-    const now = new Date().toISOString();
-    const result = this.db
-      .prepare(
-        `UPDATE coupons SET reservation_id = ?, updated_at = ?
-         WHERE id = ? AND status = 'RESERVED' AND reservation_id = ?`
+  transferCoverage(
+    couponId: number,
+    fromReservationId: number,
+    toReservationId: number,
+    newPricePerPlayerCents: number
+  ): { eligibleAmountCents: number; discountCents: number } {
+    const row = this.db
+      .prepare<[number, number], { id: number; coverage_consumed: number }>(
+        `SELECT id, coverage_consumed FROM coupon_redemptions WHERE coupon_id = ? AND reservation_id = ? AND status = 'RESERVED'`
       )
-      .run(toReservationId, now, couponId, fromReservationId);
-    if (result.changes === 0) {
-      throw new CouponConflictError('Coupon could not be transferred to the rescheduled reservation.');
-    }
-    this.audit.log('COUPON_TRANSFERRED', 'coupon', couponId, { fromReservationId, toReservationId });
+      .get(couponId, fromReservationId);
+    if (!row) throw new CouponConflictError('Coupon could not be transferred to the rescheduled reservation.');
+
+    const coupon = this.getDetailsById(couponId)!;
+    const eligibleAmountCents = newPricePerPlayerCents * row.coverage_consumed;
+    const breakdown = calculatePrice({
+      originalPriceCents: eligibleAmountCents,
+      discountType: coupon.discountType,
+      discountPercentage: coupon.discountPercentage,
+      discountAmountCents: coupon.discountAmountCents,
+    });
+
+    this.db
+      .prepare(
+        `UPDATE coupon_redemptions SET reservation_id = ?, eligible_amount_cents = ?, discount_cents = ? WHERE id = ?`
+      )
+      .run(toReservationId, eligibleAmountCents, breakdown.youSaveCents, row.id);
+    this.audit.log('COUPON_COVERAGE_TRANSFERRED', 'coupon', couponId, { fromReservationId, toReservationId });
+    return { eligibleAmountCents, discountCents: breakdown.youSaveCents };
   }
 
   revoke(id: number, reason?: string | null): Coupon {
@@ -585,8 +791,11 @@ export class CouponService {
       throw new CouponConflictError('This coupon has already been used and cannot be revoked');
     }
     if (coupon.status === 'RESERVED') {
+      const reservationIds = this.coverageState(coupon.id)
+        .activeRedemptions.filter((r) => r.status === 'RESERVED')
+        .map((r) => r.reservationId);
       throw new CouponConflictError(
-        `This coupon is reserved by reservation #${coupon.reservationId}. Cancel or edit that reservation first.`
+        `This coupon is reserved by reservation #${reservationIds.join(', #')}. Cancel or edit that reservation first.`
       );
     }
     this.db
@@ -613,7 +822,10 @@ export class CouponService {
           continue;
         }
         if (coupon.status === 'RESERVED') {
-          skipped.push({ id, why: `reserved by reservation #${coupon.reservationId}` });
+          const reservationIds = this.coverageState(coupon.id)
+            .activeRedemptions.filter((r) => r.status === 'RESERVED')
+            .map((r) => r.reservationId);
+          skipped.push({ id, why: `reserved by reservation #${reservationIds.join(', #')}` });
           continue;
         }
         if (coupon.status === 'REVOKED') {

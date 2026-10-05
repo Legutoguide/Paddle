@@ -30,6 +30,9 @@ import type {
   AvailabilitySlot,
   ReservationDashboardStats,
   ReservationReport,
+  ReservationParticipant,
+  ReservationPriceBreakdown,
+  CouponCoverageState,
 } from '@shared/types/domain';
 import type { PriceBreakdown } from '@shared/lib/pricing';
 
@@ -54,6 +57,9 @@ export interface CreateCampaignInput {
   startDate?: string | null;
   endDate?: string | null;
   notes?: string | null;
+  /** How many players a coupon generated from this campaign can cover.
+   * Defaults to 1 — the common case of one coupon discounting one player. */
+  coveragePlayers?: number;
 }
 
 export interface GenerateCodesInput {
@@ -207,6 +213,9 @@ export interface SponsorQRApi {
     revoke: (id: number, reason?: string | null) => Promise<Coupon>;
     revokeMany: (ids: number[], reason?: string | null) => Promise<{ revoked: number[]; skipped: { id: number; why: string }[] }>;
     getQr: (code: string) => Promise<string>;
+    /** Live remaining/used coverage for a coupon — e.g. "Coverage: 2,
+     * Used: 1, Remaining: 1" (Part 12 of the Prime Paddle coverage spec). */
+    coverageState: (couponId: number) => Promise<CouponCoverageState>;
   };
   history: {
     list: (params?: {
@@ -314,8 +323,17 @@ export interface SponsorQRApi {
       durationMin: number;
       periodId?: number | null;
     }) => Promise<Reservation>;
-    attachCoupon: (id: number, couponCode: string) => Promise<Reservation>;
-    detachCoupon: (id: number) => Promise<Reservation>;
+    // A reservation may carry MULTIPLE coupons (coverage can be split
+    // across players/participants) — attach/detach operate per-coupon.
+    attachCoupon: (
+      id: number,
+      couponCode: string,
+      options?: { participantId?: number | null; coverage?: number }
+    ) => Promise<Reservation>;
+    detachCoupon: (id: number, couponId: number) => Promise<Reservation>;
+    priceBreakdown: (id: number) => Promise<ReservationPriceBreakdown>;
+    listParticipants: (id: number) => Promise<ReservationParticipant[]>;
+    setParticipants: (id: number, names: Array<string | null>) => Promise<ReservationParticipant[]>;
     checkIn: (id: number) => Promise<Reservation>;
     start: (id: number) => Promise<Reservation>;
     complete: (id: number) => Promise<Reservation>;

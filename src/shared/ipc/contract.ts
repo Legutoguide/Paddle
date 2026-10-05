@@ -30,6 +30,7 @@ export const IPC = {
   COUPON_REVOKE: 'coupon:revoke',
   COUPON_REVOKE_MANY: 'coupon:revokeMany',
   COUPON_GET_QR: 'coupon:getQr',
+  COUPON_COVERAGE_STATE: 'coupon:coverageState',
 
   // History
   HISTORY_LIST: 'history:list',
@@ -115,6 +116,9 @@ export const IPC = {
   RESERVATION_RESCHEDULE_TO_ADVANCE: 'reservation:rescheduleToAdvance',
   RESERVATION_ATTACH_COUPON: 'reservation:attachCoupon',
   RESERVATION_DETACH_COUPON: 'reservation:detachCoupon',
+  RESERVATION_PRICE_BREAKDOWN: 'reservation:priceBreakdown',
+  RESERVATION_LIST_PARTICIPANTS: 'reservation:listParticipants',
+  RESERVATION_SET_PARTICIPANTS: 'reservation:setParticipants',
   RESERVATION_CHECKIN: 'reservation:checkIn',
   RESERVATION_START: 'reservation:start',
   RESERVATION_COMPLETE: 'reservation:complete',

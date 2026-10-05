@@ -186,13 +186,19 @@ function ResultCard({
   if (result.outcome === 'RESERVED') {
     // Validation-only: a reserved coupon is never consumable from this
     // screen. It becomes USED automatically when its reservation is paid.
-    const r = result.reservation;
+    // Coverage can be split across more than one reservation (e.g. a
+    // 2-player coupon, 1 unit held by each of two different bookings), so
+    // every reservation currently holding a slice of it is listed.
+    const rs = result.reservations;
+    const summary = rs
+      .map((r) => `#${r.id} (${r.customerName}, ${r.reservationDate} ${r.startTime})`)
+      .join('; ');
     return (
       <StatusCard
         icon={Lock}
         tone="warning"
         title="COUPON RESERVED"
-        message={`This coupon is already reserved and cannot be used for another reservation. Held by reservation #${r.id} (${r.customerName}, ${r.reservationDate} ${r.startTime}).`}
+        message={`This coupon is already reserved and cannot be used for another reservation. Held by reservation${rs.length > 1 ? 's' : ''} ${summary}.`}
         onBack={onBack}
       />
     );

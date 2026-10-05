@@ -3,9 +3,11 @@ import {
   mapReservation,
   mapReservationWithDetails,
   mapReservationHistory,
+  mapReservationParticipant,
   type ReservationRow,
   type ReservationWithDetailsRow,
   type ReservationHistoryRow,
+  type ReservationParticipantRow,
 } from '../db/mappers';
 import type {
   Reservation,
@@ -13,8 +15,11 @@ import type {
   ReservationHistoryEntry,
   ReservationStatus,
   ReservationType,
+  ReservationParticipant,
+  ReservationCouponLine,
+  ReservationPriceBreakdown,
+  RedemptionStatus,
 } from '../../shared/types/domain';
-import { calculatePrice } from '../../shared/lib/pricing';
 import { AuditService } from './auditService';
 import { NotificationService } from './notificationService';
 import { CustomerService, type CreateCustomerInput } from './CustomerService';
@@ -65,9 +70,17 @@ export interface CreateReservationInput {
   createdByUserId?: number | null;
 }
 
+// r.coupon_id/coupon_code is kept only as a simple "primary coupon" display
+// value (the most recently attached one) — the authoritative, possibly
+// MULTI-coupon state for a reservation lives in coupon_redemptions and is
+// read via getPriceBreakdown()/getCouponLines() below. coupon_count is the
+// number of distinct coupons currently actively attached (RESERVED or
+// CONSUMED), so list views can show "2 coupons" instead of just one code.
 const DETAILS_JOIN = `
   SELECT r.*, c.name as customer_name, c.phone as customer_phone,
-         p.name as period_name, co.code as coupon_code
+         p.name as period_name, co.code as coupon_code,
+         (SELECT COUNT(DISTINCT cr.coupon_id) FROM coupon_redemptions cr
+          WHERE cr.reservation_id = r.id AND cr.status IN ('RESERVED','CONSUMED')) as coupon_count
   FROM reservations r
   JOIN customers c ON c.id = r.customer_id
   LEFT JOIN periods p ON p.id = r.period_id
@@ -245,33 +258,21 @@ export class ReservationService {
         );
       const reservationId = Number(insertResult.lastInsertRowid);
 
-      // 5) Optional coupon attach (AVAILABLE -> RESERVED). A coupon's own
-      // campaign originalPriceCents is the price the business configured
-      // for whatever that campaign covers (often a specific group size) —
-      // it REPLACES the per-player slot price above, it does not stack
-      // with it. The discount then applies on top, via the same
-      // calculatePrice() campaigns already use.
-      let discountCents = 0;
-      let finalPriceCents = basePriceCents;
+      // 5) Optional coupon attach. A coupon's discount applies only to the
+      // slice of the reservation it COVERS (price_per_player x
+      // coupon.coveragePlayers) — never to the campaign's own listed price,
+      // and never to the whole reservation unless its coverage happens to
+      // equal the full player count. See attachCouponInternal.
       if (input.couponCode) {
-        const coupon = this.coupons.getByCode(input.couponCode.trim());
-        if (!coupon) throw new CouponNotFoundError('Coupon not found');
-        this.coupons.reserveForReservation(coupon.id, reservationId, input.reservationDate);
-        basePriceCents = coupon.originalPriceCents;
-        const breakdown = calculatePrice({
-          originalPriceCents: basePriceCents,
-          discountType: coupon.discountType,
-          discountPercentage: coupon.discountPercentage,
-          discountAmountCents: coupon.discountAmountCents,
+        this.attachCouponInternal({
+          reservationId,
+          couponCode: input.couponCode.trim(),
+          reservationDate: input.reservationDate,
+          periodId: input.periodId ?? slot.periodId,
+          durationMin: input.durationMin,
+          players: input.players,
+          actorUserId: input.createdByUserId ?? null,
         });
-        discountCents = breakdown.youSaveCents;
-        finalPriceCents = breakdown.finalPriceCents;
-
-        this.db
-          .prepare(
-            `UPDATE reservations SET coupon_id = ?, base_price_cents = ?, discount_cents = ?, final_price_cents = ? WHERE id = ?`
-          )
-          .run(coupon.id, basePriceCents, discountCents, finalPriceCents, reservationId);
       }
 
       this.recordHistory(reservationId, null, 'CONFIRMED', input.createdByUserId ?? null, `${reservationType} created`);
@@ -304,85 +305,285 @@ export class ReservationService {
   }
 
   // --------------------------------------------------------------------
-  // Coupon attach/detach on an existing reservation (before payment).
+  // Coupon coverage helpers (schema v7)
+  //
+  // A reservation can carry MULTIPLE coupons (Part 7 of the spec) — the
+  // authoritative record of which coupons cover how many players is always
+  // coupon_redemptions, never a single column. reservations.coupon_id /
+  // discount_cents / final_price_cents are a maintained CACHE (recomputed
+  // by recalculateAggregates after every attach/detach/consume) purely so
+  // existing simple reads (lists, reports) keep working without a join.
   // --------------------------------------------------------------------
 
-  /** The slot's own per-player price × players, with no coupon involved —
-   * used both to show what a booking would cost without a coupon and to
-   * restore it correctly when a coupon is detached. Never reuses a stored
-   * base_price_cents directly, since that column may currently hold a
-   * coupon's own (non-per-player) package price instead. */
-  private resolveNoCouponBasePrice(reservationDate: string, periodId: number | null, durationMin: number, players: number): number {
-    const rule = this.pricing.resolvePrice({ date: reservationDate, periodId, durationMin });
-    return rule.priceCents * players;
+  /** The reservation's own per-player rate, resolved fresh from pricing_rules
+   * (never multiplied by players here — callers multiply as needed). */
+  private pricePerPlayerCentsFor(reservationDate: string, periodId: number | null, durationMin: number): number {
+    return this.pricing.resolvePrice({ date: reservationDate, periodId, durationMin }).priceCents;
   }
 
-  attachCoupon(reservationId: number, couponCode: string, actorUserId: number | null = null): Reservation {
+  private resolveNoCouponBasePrice(reservationDate: string, periodId: number | null, durationMin: number, players: number): number {
+    return this.pricePerPlayerCentsFor(reservationDate, periodId, durationMin) * players;
+  }
+
+  /** How many of this reservation's players are not yet covered by any
+   * active (RESERVED or CONSUMED) coupon — a new coupon can cover at most
+   * this many, which is exactly what makes "coupon bigger than remaining
+   * players" result in a capped/partial grant instead of an error. */
+  private uncoveredPlayers(reservationId: number, players: number): number {
+    const row = this.db
+      .prepare<[number], { total: number | null }>(
+        `SELECT SUM(coverage_consumed) as total FROM coupon_redemptions WHERE reservation_id = ? AND status IN ('RESERVED','CONSUMED')`
+      )
+      .get(reservationId);
+    return Math.max(0, players - (row?.total ?? 0));
+  }
+
+  /** Distinct coupon ids currently RESERVED (not yet paid/consumed) by this
+   * reservation — used to release/consume "every coupon", not just the
+   * single legacy coupon_id. */
+  private activeCouponIds(reservationId: number): number[] {
+    return this.db
+      .prepare<[number], { coupon_id: number }>(
+        `SELECT DISTINCT coupon_id FROM coupon_redemptions WHERE reservation_id = ? AND status = 'RESERVED'`
+      )
+      .all(reservationId)
+      .map((r: { coupon_id: number }) => r.coupon_id);
+  }
+
+  /** Recomputes the cached discount_cents/final_price_cents/coupon_id
+   * (="most recently attached" for simple display) from the ledger. Called
+   * after every attach/detach/consume/release so reads never need a join. */
+  private recalculateAggregates(reservationId: number): void {
+    const reservation = this.getById(reservationId);
+    if (!reservation) return;
+    const rows = this.db
+      .prepare<[number], { discount_cents: number; coupon_id: number }>(
+        `SELECT discount_cents, coupon_id FROM coupon_redemptions
+         WHERE reservation_id = ? AND status IN ('RESERVED','CONSUMED') ORDER BY created_at`
+      )
+      .all(reservationId);
+    const totalDiscount = rows.reduce((sum: number, r: { discount_cents: number }) => sum + r.discount_cents, 0);
+    const finalPrice = Math.max(0, reservation.basePriceCents - totalDiscount);
+    const primaryCouponId = rows.length > 0 ? rows[rows.length - 1].coupon_id : null;
+    this.db
+      .prepare(
+        `UPDATE reservations SET coupon_id = ?, discount_cents = ?, final_price_cents = ?,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
+      )
+      .run(primaryCouponId, totalDiscount, finalPrice, reservationId);
+  }
+
+  /** Shared by creation-time attach and the public attachCoupon(). */
+  private attachCouponInternal(params: {
+    reservationId: number;
+    couponCode: string;
+    reservationDate: string;
+    periodId: number | null;
+    durationMin: number;
+    players: number;
+    actorUserId: number | null;
+    participantId?: number | null;
+    requestedCoverage?: number;
+  }): { coverageGranted: number } {
+    const coupon = this.coupons.getByCode(params.couponCode);
+    if (!coupon) throw new CouponNotFoundError('Coupon not found');
+
+    const uncovered = this.uncoveredPlayers(params.reservationId, params.players);
+    const desired = params.requestedCoverage ?? Math.min(coupon.coveragePlayers, uncovered);
+    if (desired <= 0) {
+      throw new ReservationConflictError(
+        'All players on this reservation are already covered by a coupon.'
+      );
+    }
+    const pricePerPlayerCents = this.pricePerPlayerCentsFor(params.reservationDate, params.periodId, params.durationMin);
+
+    const result = this.coupons.reserveCoverage({
+      couponId: coupon.id,
+      reservationId: params.reservationId,
+      participantId: params.participantId ?? null,
+      requestedCoverage: desired,
+      pricePerPlayerCents,
+      playDate: params.reservationDate,
+      actorUserId: params.actorUserId,
+    });
+
+    this.recalculateAggregates(params.reservationId);
+    this.audit.log('RESERVATION_COUPON_ATTACHED', 'reservation', params.reservationId, {
+      couponId: coupon.id,
+      coverageGranted: result.coverageGranted,
+      actorUserId: params.actorUserId,
+    });
+    return { coverageGranted: result.coverageGranted };
+  }
+
+  // --------------------------------------------------------------------
+  // Coupon attach/detach on an existing reservation (before payment).
+  // A reservation may carry MULTIPLE coupons (Part 7) — each attach call
+  // adds one more, as long as the reservation still has uncovered players.
+  // --------------------------------------------------------------------
+
+  /**
+   * Attach one more coupon to a reservation. The coverage actually granted
+   * is capped at both the coupon's own remaining coverage AND this
+   * reservation's uncovered player count — e.g. attaching a 4-player coupon
+   * to a 4-player reservation that already has a 1-player coupon on it only
+   * grants 3 (never double-discounts the 1 player already covered), and
+   * this capping is exactly what produces PARTIAL coupon usage.
+   */
+  attachCoupon(
+    reservationId: number,
+    couponCode: string,
+    actorUserId: number | null = null,
+    options?: { participantId?: number | null; coverage?: number }
+  ): Reservation {
     const attach = this.db.transaction((): Reservation => {
       const reservation = this.getById(reservationId);
       if (!reservation) throw new ReservationNotFoundError(`Reservation ${reservationId} not found`);
       if (reservation.paymentStatus === 'PAID') {
         throw new ReservationConflictError('Cannot attach a coupon to an already-paid reservation');
       }
-      if (reservation.couponId) {
-        throw new ReservationConflictError('This reservation already has a coupon attached; detach it first');
-      }
-      const coupon = this.coupons.getByCode(couponCode.trim());
-      if (!coupon) throw new CouponNotFoundError('Coupon not found');
-
-      this.coupons.reserveForReservation(coupon.id, reservationId, reservation.reservationDate);
-      // The coupon's own campaign price replaces the per-player slot price
-      // — it does not stack with it (see createInternal for the full
-      // reasoning: a coupon often already represents a specific group's
-      // package price, e.g. "2 players", configured by the business).
-      const basePriceCents = coupon.originalPriceCents;
-      const breakdown = calculatePrice({
-        originalPriceCents: basePriceCents,
-        discountType: coupon.discountType,
-        discountPercentage: coupon.discountPercentage,
-        discountAmountCents: coupon.discountAmountCents,
+      this.attachCouponInternal({
+        reservationId,
+        couponCode: couponCode.trim(),
+        reservationDate: reservation.reservationDate,
+        periodId: reservation.periodId,
+        durationMin: reservation.durationMin,
+        players: reservation.players,
+        actorUserId,
+        participantId: options?.participantId ?? null,
+        requestedCoverage: options?.coverage,
       });
-      this.db
-        .prepare(
-          `UPDATE reservations SET coupon_id = ?, base_price_cents = ?, discount_cents = ?, final_price_cents = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-        )
-        .run(coupon.id, basePriceCents, breakdown.youSaveCents, breakdown.finalPriceCents, reservationId);
-
-      this.audit.log('RESERVATION_COUPON_ATTACHED', 'reservation', reservationId, { couponId: coupon.id, actorUserId });
       return this.getById(reservationId)!;
     });
     return attach();
   }
 
-  detachCoupon(reservationId: number, actorUserId: number | null = null): Reservation {
+  /** Detach one specific coupon (by its coupon id — a reservation can have
+   * more than one) from a reservation, releasing its RESERVED coverage. */
+  detachCoupon(reservationId: number, couponId: number, actorUserId: number | null = null): Reservation {
     const detach = this.db.transaction((): Reservation => {
       const reservation = this.getById(reservationId);
       if (!reservation) throw new ReservationNotFoundError(`Reservation ${reservationId} not found`);
       if (reservation.paymentStatus === 'PAID') {
         throw new ReservationConflictError('Cannot detach a coupon from an already-paid reservation');
       }
-      if (reservation.couponId) {
-        this.coupons.releaseReservation(reservation.couponId, reservationId);
+      const { released } = this.coupons.releaseCoverage(couponId, reservationId);
+      if (!released) {
+        throw new ReservationConflictError('This coupon is not currently attached to this reservation.');
       }
-      // Restore the per-player slot price — base_price_cents currently
-      // holds the coupon's own package price, not the per-player rate, so
-      // it must be re-resolved fresh rather than reused as-is.
-      const restoredBase = this.resolveNoCouponBasePrice(
-        reservation.reservationDate,
-        reservation.periodId,
-        reservation.durationMin,
-        reservation.players
-      );
-      this.db
-        .prepare(
-          `UPDATE reservations SET coupon_id = NULL, base_price_cents = ?, discount_cents = 0, final_price_cents = ?,
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
-        )
-        .run(restoredBase, restoredBase, reservationId);
-      this.audit.log('RESERVATION_COUPON_DETACHED', 'reservation', reservationId, { actorUserId });
+      this.recalculateAggregates(reservationId);
+      this.audit.log('RESERVATION_COUPON_DETACHED', 'reservation', reservationId, { couponId, actorUserId });
       return this.getById(reservationId)!;
     });
     return detach();
+  }
+
+  /** Full, itemized price breakdown for a reservation — every attached
+   * coupon as its own line, exactly as Part 10 of the spec describes.
+   * Always derived live from coupon_redemptions, never from the cached
+   * aggregate columns, so it is always authoritative. */
+  getPriceBreakdown(reservationId: number): ReservationPriceBreakdown {
+    const reservation = this.getById(reservationId);
+    if (!reservation) throw new ReservationNotFoundError(`Reservation ${reservationId} not found`);
+
+    const pricePerPlayerCents = this.pricePerPlayerCentsFor(
+      reservation.reservationDate,
+      reservation.periodId,
+      reservation.durationMin
+    );
+
+    const rows = this.db
+      .prepare<[number], {
+        coupon_id: number;
+        code: string;
+        sponsor_name: string;
+        campaign_name: string;
+        participant_id: number | null;
+        participant_name: string | null;
+        coverage_consumed: number;
+        eligible_amount_cents: number;
+        discount_cents: number;
+        status: string;
+      }>(
+        `SELECT cr.coupon_id as coupon_id, c.code as code, s.name as sponsor_name, cm.campaign_name as campaign_name,
+                cr.participant_id as participant_id, p.name as participant_name,
+                cr.coverage_consumed as coverage_consumed, cr.eligible_amount_cents as eligible_amount_cents,
+                cr.discount_cents as discount_cents, cr.status as status
+         FROM coupon_redemptions cr
+         JOIN coupons c ON c.id = cr.coupon_id
+         JOIN sponsors s ON s.id = c.sponsor_id
+         JOIN campaigns cm ON cm.id = c.campaign_id
+         LEFT JOIN reservation_participants p ON p.id = cr.participant_id
+         WHERE cr.reservation_id = ? AND cr.status IN ('RESERVED','CONSUMED')
+         ORDER BY cr.created_at`
+      )
+      .all(reservationId);
+
+    const coupons: ReservationCouponLine[] = rows.map(
+      (r: {
+        coupon_id: number; code: string; sponsor_name: string; campaign_name: string;
+        participant_id: number | null; participant_name: string | null; coverage_consumed: number;
+        eligible_amount_cents: number; discount_cents: number; status: string;
+      }) => ({
+        couponId: r.coupon_id,
+        couponCode: r.code,
+        sponsorName: r.sponsor_name,
+        campaignName: r.campaign_name,
+        participantId: r.participant_id,
+        participantName: r.participant_name,
+        coverageConsumed: r.coverage_consumed,
+        eligibleAmountCents: r.eligible_amount_cents,
+        discountCents: r.discount_cents,
+        status: r.status as RedemptionStatus,
+      })
+    );
+
+    const totalDiscountCents = coupons.reduce((sum, c) => sum + c.discountCents, 0);
+    const subtotalCents = pricePerPlayerCents * reservation.players;
+
+    return {
+      players: reservation.players,
+      pricePerPlayerCents,
+      subtotalCents,
+      coupons,
+      totalDiscountCents,
+      finalPriceCents: Math.max(0, subtotalCents - totalDiscountCents),
+      uncoveredPlayers: this.uncoveredPlayers(reservationId, reservation.players),
+    };
+  }
+
+  // --------------------------------------------------------------------
+  // Optional reservation participants (Part 5/6) — purely for naming who
+  // used which coupon. Never required: a reservation with N players and no
+  // participant rows at all works exactly the same as before.
+  // --------------------------------------------------------------------
+
+  listParticipants(reservationId: number): ReservationParticipant[] {
+    return this.db
+      .prepare<[number], ReservationParticipantRow>(
+        `SELECT * FROM reservation_participants WHERE reservation_id = ? ORDER BY sort_order, id`
+      )
+      .all(reservationId)
+      .map(mapReservationParticipant);
+  }
+
+  /** Replaces the full participant list for a reservation (names only —
+   * optional, never forced; an empty/short list is perfectly valid). */
+  setParticipants(reservationId: number, names: Array<string | null>): ReservationParticipant[] {
+    const reservation = this.getById(reservationId);
+    if (!reservation) throw new ReservationNotFoundError(`Reservation ${reservationId} not found`);
+    if (names.length > reservation.players) {
+      throw new ReservationValidationError('Cannot name more participants than the reservation has players');
+    }
+    const replace = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM reservation_participants WHERE reservation_id = ?`).run(reservationId);
+      const insert = this.db.prepare(
+        `INSERT INTO reservation_participants (reservation_id, name, sort_order) VALUES (?, ?, ?)`
+      );
+      names.forEach((name, i) => insert.run(reservationId, name?.trim() || null, i));
+    });
+    replace();
+    return this.listParticipants(reservationId);
   }
 
   // --------------------------------------------------------------------
@@ -428,11 +629,15 @@ export class ReservationService {
         );
       }
 
-      if ((toStatus === 'CANCELLED' || toStatus === 'NO_SHOW') && reservation.couponId) {
-        // RESERVED -> AVAILABLE. A no-op if the coupon was already USED
-        // (e.g. via a CEO override) — cancelling doesn't undo a completed
-        // redemption.
-        this.coupons.releaseReservation(reservation.couponId, reservationId);
+      if (toStatus === 'CANCELLED' || toStatus === 'NO_SHOW') {
+        // Release every coupon's coverage this reservation is holding — not
+        // just the "primary" one, since a reservation can carry several.
+        // Each is a no-op for any coupon already CONSUMED (paid) — cancelling
+        // never undoes a completed redemption.
+        for (const couponId of this.activeCouponIds(reservationId)) {
+          this.coupons.releaseCoverage(couponId, reservationId);
+        }
+        this.recalculateAggregates(reservationId);
       }
 
       this.db
@@ -489,11 +694,21 @@ export class ReservationService {
 
   markAsPaid(reservationId: number, actorUserId: number | null = null): Reservation {
     const run = this.db.transaction((): Reservation => {
-      const reservation = this.getById(reservationId);
+      let reservation = this.getById(reservationId);
       if (!reservation) throw new ReservationNotFoundError(`Reservation ${reservationId} not found`);
       if (reservation.status === 'CANCELLED' || reservation.status === 'NO_SHOW') {
         throw new ReservationConflictError(`Cannot take payment on a ${reservation.status} reservation`);
       }
+
+      // Self-heal before charging: recompute discount/total from the LIVE
+      // ledger rather than trusting the cached columns as-is. This matters
+      // because a coupon could in principle have been released (e.g. by an
+      // administrative action elsewhere) without this reservation's cache
+      // being refreshed yet — the customer must always be charged the
+      // correct CURRENT amount, never a stale one that assumes a coupon
+      // still applies when it no longer does.
+      this.recalculateAggregates(reservationId);
+      reservation = this.getById(reservationId)!;
 
       const paidAt = new Date().toISOString();
       const updateResult = this.db
@@ -509,18 +724,20 @@ export class ReservationService {
         throw new ReservationConflictError('This reservation has already been paid');
       }
 
-      // The coupon consumption below runs inside this SAME transaction as
-      // the payment_status update above. If it throws, better-sqlite3 rolls
-      // back the entire transaction — payment_status reverts to UNPAID too.
-      // "PAID but coupon still RESERVED" is therefore structurally
-      // impossible, not just unlikely.
-      if (reservation.couponId) {
-        this.coupons.consumeForReservation(reservation.couponId, reservationId);
+      // Every coupon's RESERVED coverage is consumed inside this SAME
+      // transaction as the payment_status update above — if any of them
+      // throws, better-sqlite3 rolls back the whole transaction,
+      // payment_status reverts to UNPAID too. "PAID but a coupon still
+      // RESERVED" is therefore structurally impossible, not just unlikely.
+      const couponIds = this.activeCouponIds(reservationId);
+      for (const couponId of couponIds) {
+        this.coupons.consumeCoverage(couponId, reservationId);
       }
+      if (couponIds.length > 0) this.recalculateAggregates(reservationId);
 
       this.audit.log('RESERVATION_PAYMENT_COMPLETED', 'reservation', reservationId, {
         finalPriceCents: reservation.finalPriceCents,
-        couponId: reservation.couponId,
+        couponIds,
         actorUserId,
       });
       this.notifications.emit({
@@ -576,39 +793,23 @@ export class ReservationService {
         throw new SlotUnavailableError('The requested new slot is not bookable');
       }
 
-      const rule = this.pricing.resolvePrice({
-        date: params.reservationDate,
-        periodId: params.periodId ?? slot.periodId,
-        durationMin: params.durationMin,
-      });
+      const newPricePerPlayerCents = this.pricePerPlayerCentsFor(
+        params.reservationDate,
+        params.periodId ?? slot.periodId,
+        params.durationMin
+      );
+      const basePriceCents = newPricePerPlayerCents * original.players;
 
-      // Same rule as creation/attach: a coupon's own campaign price
-      // replaces the per-player slot price rather than stacking with it.
-      let basePriceCents = rule.priceCents * original.players;
-      let discountCents = 0;
-      let finalPriceCents = basePriceCents;
-      if (original.couponId) {
-        const coupon = this.coupons.getDetailsById(original.couponId);
-        if (coupon) {
-          basePriceCents = coupon.originalPriceCents;
-          const breakdown = calculatePrice({
-            originalPriceCents: basePriceCents,
-            discountType: coupon.discountType,
-            discountPercentage: coupon.discountPercentage,
-            discountAmountCents: coupon.discountAmountCents,
-          });
-          discountCents = breakdown.youSaveCents;
-          finalPriceCents = breakdown.finalPriceCents;
-        }
-      }
-
+      // Insert first with no coupon/discount — every coupon the original
+      // reservation held gets transferred (with its eligible amount
+      // repriced for the new date) right after, then aggregates recompute.
       const insertResult = this.db
         .prepare(
           `INSERT INTO reservations
             (customer_id, reservation_type, status, reservation_date, start_time, duration_min,
              period_id, players, base_price_cents, discount_cents, final_price_cents,
              coupon_id, payment_status, notes, created_by_user_id)
-           VALUES (?, 'ADVANCE', 'CONFIRMED', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNPAID', ?, ?)`
+           VALUES (?, 'ADVANCE', 'CONFIRMED', ?, ?, ?, ?, ?, ?, 0, ?, NULL, 'UNPAID', ?, ?)`
         )
         .run(
           original.customerId,
@@ -618,17 +819,17 @@ export class ReservationService {
           params.periodId ?? slot.periodId,
           original.players,
           basePriceCents,
-          discountCents,
-          finalPriceCents,
-          original.couponId,
+          basePriceCents,
           original.notes,
           params.actorUserId ?? null
         );
       const newId = Number(insertResult.lastInsertRowid);
 
-      if (original.couponId) {
-        this.coupons.transferReservation(original.couponId, original.id, newId);
+      const transferredCouponIds = this.activeCouponIds(original.id);
+      for (const couponId of transferredCouponIds) {
+        this.coupons.transferCoverage(couponId, original.id, newId, newPricePerPlayerCents);
       }
+      if (transferredCouponIds.length > 0) this.recalculateAggregates(newId);
 
       this.db
         .prepare(
@@ -636,6 +837,9 @@ export class ReservationService {
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`
         )
         .run(`Rescheduled to reservation #${newId}`, original.id);
+      // Every coupon it held has just moved to the new reservation, so its
+      // own cached discount/total should show 0, not stale pre-reschedule numbers.
+      this.recalculateAggregates(original.id);
 
       this.recordHistory(original.id, original.status, 'CANCELLED', params.actorUserId ?? null, `Rescheduled to #${newId}`);
       this.recordHistory(newId, null, 'CONFIRMED', params.actorUserId ?? null, `Rescheduled from #${original.id}`);

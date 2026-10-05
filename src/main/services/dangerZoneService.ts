@@ -41,6 +41,8 @@ export class DangerZoneService {
 
     const tx = this.db.transaction(() => {
       this.db.exec(`
+        DELETE FROM coupon_redemptions;
+        DELETE FROM reservation_participants;
         DELETE FROM reservation_history;
         DELETE FROM reservations;
         DELETE FROM customers;
